@@ -11,6 +11,8 @@ export const AssignmentStatus = {
   REVISED: { code: "REVISED", label: "已订正" },
 };
 
+const RICH_MAGIC = "RICH1\n";
+
 export function statusLabel(statusCode) {
   return AssignmentStatus[statusCode]?.label ?? statusCode ?? "";
 }
@@ -18,6 +20,165 @@ export function statusLabel(statusCode) {
 export function isTextFileName(fileName) {
   const name = String(fileName || "").toLowerCase();
   return name.endsWith(".txt") || name.endsWith(".java") || name.endsWith(".md") || name.endsWith(".csv");
+}
+
+function encodeUtf8ToBase64(text) {
+  const bytes = new TextEncoder().encode(String(text ?? ""));
+  let binary = "";
+  for (let i = 0; i < bytes.length; i += 1) binary += String.fromCharCode(bytes[i]);
+  return btoa(binary);
+}
+
+function decodeBase64ToUtf8(b64) {
+  const binary = atob(String(b64 ?? ""));
+  const bytes = new Uint8Array(binary.length);
+  for (let i = 0; i < binary.length; i += 1) bytes[i] = binary.charCodeAt(i);
+  return new TextDecoder().decode(bytes);
+}
+
+function isRichContent(content) {
+  return typeof content === "string" && content.startsWith(RICH_MAGIC);
+}
+
+export function exportPlainTextFromRich(content) {
+  if (!isRichContent(content)) return String(content ?? "");
+  const lines = String(content).split("\n");
+  let out = "";
+  for (let i = 1; i < lines.length; i += 1) {
+    const line = lines[i];
+    if (!line) continue;
+    const idx = line.indexOf(":");
+    if (idx <= 0) continue;
+    const payload = line.slice(idx + 1);
+    if (!payload) continue;
+    out += decodeBase64ToUtf8(payload);
+  }
+  return out;
+}
+
+function splitLinesPreserveNewline(text) {
+  const s = String(text ?? "");
+  if (!s) return [];
+  const lines = [];
+  let start = 0;
+  for (let i = 0; i < s.length; i += 1) {
+    if (s.charCodeAt(i) === 10) {
+      lines.push(s.slice(start, i + 1));
+      start = i + 1;
+    }
+  }
+  if (start < s.length) lines.push(s.slice(start));
+  return lines;
+}
+
+function lcsMatches(base, target) {
+  const n = base.length;
+  const m = target.length;
+  const dp = Array.from({ length: n + 1 }, () => new Array(m + 1).fill(0));
+
+  for (let i = n - 1; i >= 0; i -= 1) {
+    for (let j = m - 1; j >= 0; j -= 1) {
+      dp[i][j] = base[i] === target[j] ? dp[i + 1][j + 1] + 1 : Math.max(dp[i + 1][j], dp[i][j + 1]);
+    }
+  }
+
+  const match = new Array(m).fill(-1);
+  let i = 0;
+  let j = 0;
+  while (i < n && j < m) {
+    if (base[i] === target[j]) {
+      match[j] = i;
+      i += 1;
+      j += 1;
+    } else if (dp[i + 1][j] >= dp[i][j + 1]) i += 1;
+    else j += 1;
+  }
+  return match;
+}
+
+function buildRichFromRuns(sources, texts) {
+  let rich = RICH_MAGIC;
+  for (let i = 0; i < texts.length; i += 1) {
+    const b64 = encodeUtf8ToBase64(texts[i] ?? "");
+    rich += `${sources[i]}:${b64}\n`;
+  }
+  return rich;
+}
+
+function buildRunsByLineSingleStage(baseVersion, targetVersion, unmatchedSource) {
+  const baseLines = splitLinesPreserveNewline(baseVersion);
+  const targetLines = splitLinesPreserveNewline(targetVersion);
+  const matchTargetToBase = lcsMatches(baseLines, targetLines);
+
+  const runSources = [];
+  const runTexts = [];
+
+  let currentSource = "";
+  let currentText = "";
+  for (let i = 0; i < targetLines.length; i += 1) {
+    const src = matchTargetToBase[i] >= 0 ? "O" : unmatchedSource;
+    if (!currentSource) currentSource = src;
+    if (src !== currentSource) {
+      runSources.push(currentSource);
+      runTexts.push(currentText);
+      currentSource = src;
+      currentText = "";
+    }
+    currentText += targetLines[i];
+  }
+  if (currentSource) {
+    runSources.push(currentSource);
+    runTexts.push(currentText);
+  }
+  return [runSources, runTexts];
+}
+
+function buildRunsByLineTwoStage(original, teacherVersion, studentVersion) {
+  const originalLines = splitLinesPreserveNewline(original);
+  const teacherLines = splitLinesPreserveNewline(teacherVersion);
+  const matchTeacherToOriginal = lcsMatches(originalLines, teacherLines);
+  const teacherSources = teacherLines.map((_, idx) => (matchTeacherToOriginal[idx] >= 0 ? "O" : "T"));
+
+  const studentLines = splitLinesPreserveNewline(studentVersion);
+  const matchStudentToTeacher = lcsMatches(teacherLines, studentLines);
+
+  const runSources = [];
+  const runTexts = [];
+  let currentSource = "";
+  let currentText = "";
+  for (let i = 0; i < studentLines.length; i += 1) {
+    const teacherIdx = matchStudentToTeacher[i];
+    const src = teacherIdx >= 0 ? teacherSources[teacherIdx] : "S";
+    if (!currentSource) currentSource = src;
+    if (src !== currentSource) {
+      runSources.push(currentSource);
+      runTexts.push(currentText);
+      currentSource = src;
+      currentText = "";
+    }
+    currentText += studentLines[i];
+  }
+  if (currentSource) {
+    runSources.push(currentSource);
+    runTexts.push(currentText);
+  }
+  return [runSources, runTexts];
+}
+
+function migrateLegacyToRich(originalText, teacherPlain, studentPlain) {
+  const original = String(originalText ?? "");
+  const teacher = String(teacherPlain ?? "");
+  const student = String(studentPlain ?? "");
+
+  if (!teacher.trim() && !student.trim()) {
+    return buildRichFromRuns(["O"], [original]);
+  }
+  if (student.trim()) {
+    const [sources, texts] = buildRunsByLineTwoStage(original, teacher.trim() ? teacher : original, student);
+    return buildRichFromRuns(sources, texts);
+  }
+  const [sources, texts] = buildRunsByLineSingleStage(original, teacher, "T");
+  return buildRichFromRuns(sources, texts);
 }
 
 function openDb() {
@@ -289,6 +450,38 @@ export async function updateSubmissionDraft({ submissionId, patch }) {
   return submission;
 }
 
+export async function ensureOnlineEditableContent({ submissionId }) {
+  const id = toSafeString(submissionId);
+  if (!id) throw new Error("参数错误");
+
+  const db = await openDb();
+  const tx = db.transaction([STORE_SUBMISSIONS], "readonly");
+  const store = tx.objectStore(STORE_SUBMISSIONS);
+  const submission = await new Promise((resolve, reject) => {
+    const req = store.get(id);
+    req.onsuccess = () => resolve(req.result || null);
+    req.onerror = () => reject(req.error || new Error("读取作业失败"));
+  });
+  await txDone(tx);
+  db.close();
+
+  if (!submission) throw new Error("作业不存在");
+  if (!isTextFileName(submission.fileName)) throw new Error("当前文件类型不支持在线编辑");
+
+  const originalText = await loadSubmissionOriginalText(submission);
+  const current = submission.onlineReviewContent;
+  if (isRichContent(current)) {
+    return { submission, originalText, richContent: current };
+  }
+
+  const rich = migrateLegacyToRich(originalText, submission.onlineReviewContent, submission.onlineStudentFixContent);
+  const updated = await updateSubmissionDraft({
+    submissionId: submission.id,
+    patch: { onlineReviewContent: rich, onlineStudentFixContent: "", lineNotes: {} },
+  });
+  return { submission: updated, originalText, richContent: rich };
+}
+
 export async function listAllSubmissions() {
   const db = await openDb();
   const tx = db.transaction([STORE_SUBMISSIONS], "readonly");
@@ -345,32 +538,32 @@ export async function saveOriginalTextFile({ submissionId, text }) {
   if (!id) throw new Error("参数错误");
 
   const db = await openDb();
-  const tx = db.transaction([STORE_SUBMISSIONS], "readwrite");
-  const store = tx.objectStore(STORE_SUBMISSIONS);
+  const loadTx = db.transaction([STORE_SUBMISSIONS], "readonly");
+  const loadStore = loadTx.objectStore(STORE_SUBMISSIONS);
 
   const submission = await new Promise((resolve, reject) => {
-    const req = store.get(id);
+    const req = loadStore.get(id);
     req.onsuccess = () => resolve(req.result || null);
     req.onerror = () => reject(req.error || new Error("读取作业失败"));
   });
+  await txDone(loadTx);
 
   if (!submission) {
-    tx.abort();
     db.close();
     throw new Error("作业不存在");
   }
 
   if (!isTextFileName(submission.fileName)) {
-    tx.abort();
     db.close();
     throw new Error("当前文件类型不支持在线编辑");
   }
 
   const fileRecord = await putTextFile(db, { name: submission.fileName, text });
   submission.originalFileKey = fileRecord.key;
-  store.put(submission);
 
-  await txDone(tx);
+  const saveTx = db.transaction([STORE_SUBMISSIONS], "readwrite");
+  saveTx.objectStore(STORE_SUBMISSIONS).put(submission);
+  await txDone(saveTx);
   db.close();
   return submission;
 }
@@ -380,17 +573,17 @@ export async function saveOnlineReview({ submissionId, reviewContent, teacherNot
   if (!id) throw new Error("参数错误");
 
   const db = await openDb();
-  const tx = db.transaction([STORE_SUBMISSIONS], "readwrite");
-  const store = tx.objectStore(STORE_SUBMISSIONS);
+  const loadTx = db.transaction([STORE_SUBMISSIONS], "readonly");
+  const loadStore = loadTx.objectStore(STORE_SUBMISSIONS);
 
   const submission = await new Promise((resolve, reject) => {
-    const req = store.get(id);
+    const req = loadStore.get(id);
     req.onsuccess = () => resolve(req.result || null);
     req.onerror = () => reject(req.error || new Error("读取作业失败"));
   });
+  await txDone(loadTx);
 
   if (!submission) {
-    tx.abort();
     db.close();
     throw new Error("作业不存在");
   }
@@ -400,14 +593,18 @@ export async function saveOnlineReview({ submissionId, reviewContent, teacherNot
   submission.status = AssignmentStatus.REVIEWED.code;
 
   if (isTextFileName(submission.fileName)) {
-    const reviewName = deriveFileName(submission.fileName, "_reviewed");
-    const fileRecord = await putTextFile(db, { name: reviewName, text: submission.onlineReviewContent });
+    const editedName = deriveFileName(submission.fileName, "_edited");
+    const plain = exportPlainTextFromRich(submission.onlineReviewContent);
+    const fileRecord = await putTextFile(db, { name: editedName, text: plain });
     submission.reviewFileKey = fileRecord.key;
-    submission.reviewFileName = reviewName;
+    submission.reviewFileName = editedName;
+    submission.revisedFileKey = fileRecord.key;
+    submission.revisedFileName = editedName;
   }
 
-  store.put(submission);
-  await txDone(tx);
+  const saveTx = db.transaction([STORE_SUBMISSIONS], "readwrite");
+  saveTx.objectStore(STORE_SUBMISSIONS).put(submission);
+  await txDone(saveTx);
   db.close();
   return submission;
 }
@@ -417,33 +614,38 @@ export async function saveStudentCorrection({ submissionId, correctionContent })
   if (!id) throw new Error("参数错误");
 
   const db = await openDb();
-  const tx = db.transaction([STORE_SUBMISSIONS], "readwrite");
-  const store = tx.objectStore(STORE_SUBMISSIONS);
+  const loadTx = db.transaction([STORE_SUBMISSIONS], "readonly");
+  const loadStore = loadTx.objectStore(STORE_SUBMISSIONS);
 
   const submission = await new Promise((resolve, reject) => {
-    const req = store.get(id);
+    const req = loadStore.get(id);
     req.onsuccess = () => resolve(req.result || null);
     req.onerror = () => reject(req.error || new Error("读取作业失败"));
   });
+  await txDone(loadTx);
 
   if (!submission) {
-    tx.abort();
     db.close();
     throw new Error("作业不存在");
   }
 
-  submission.onlineStudentFixContent = String(correctionContent ?? "");
+  submission.onlineReviewContent = String(correctionContent ?? "");
+  submission.onlineStudentFixContent = "";
   submission.status = AssignmentStatus.REVISED.code;
 
   if (isTextFileName(submission.fileName)) {
-    const revisedName = deriveFileName(submission.fileName, "_revised");
-    const fileRecord = await putTextFile(db, { name: revisedName, text: submission.onlineStudentFixContent });
+    const editedName = deriveFileName(submission.fileName, "_edited");
+    const plain = exportPlainTextFromRich(submission.onlineReviewContent);
+    const fileRecord = await putTextFile(db, { name: editedName, text: plain });
     submission.revisedFileKey = fileRecord.key;
-    submission.revisedFileName = revisedName;
+    submission.revisedFileName = editedName;
+    submission.reviewFileKey = fileRecord.key;
+    submission.reviewFileName = editedName;
   }
 
-  store.put(submission);
-  await txDone(tx);
+  const saveTx = db.transaction([STORE_SUBMISSIONS], "readwrite");
+  saveTx.objectStore(STORE_SUBMISSIONS).put(submission);
+  await txDone(saveTx);
   db.close();
   return submission;
 }

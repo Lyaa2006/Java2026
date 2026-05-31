@@ -81,7 +81,12 @@ public class TeacherPanel extends JPanel {
         new SwingWorker<Void, Void>() {
             @Override
             protected Void doInBackground() throws Exception {
-                FileUtils.copyFile(source, target);
+                if (submissionService.isTextSubmission(submission) && submission.getOnlineReviewContent() != null && !submission.getOnlineReviewContent().isBlank()) {
+                    String content = submissionService.exportOnlineEditablePlainText(submission);
+                    FileUtils.writeText(target, content);
+                } else {
+                    FileUtils.copyFile(source, target);
+                }
                 return null;
             }
 
@@ -149,28 +154,45 @@ public class TeacherPanel extends JPanel {
             return;
         }
         statusLabel.setText("正在加载作业内容...");
-        new SwingWorker<String, Void>() {
+        new SwingWorker<Object[], Void>() {
             @Override
-            protected String doInBackground() throws Exception {
-                return submissionService.loadSubmissionText(submission);
+            protected Object[] doInBackground() throws Exception {
+                String original = submissionService.loadSubmissionText(submission);
+                String rich = submissionService.ensureOnlineEditableContent(submission, original);
+                String lockedBy = submissionService.tryAcquireOnlineEditLock(submission, "TEACHER", teacher.getUsername());
+                return new Object[]{rich, lockedBy};
             }
 
             @Override
             protected void done() {
+                String lockedBy = null;
                 try {
-                    String original = get();
+                    Object[] data = get();
+                    String rich = (String) data[0];
+                    lockedBy = (String) data[1];
+                    boolean editable = lockedBy == null;
                     OnlineReviewDialog dialog = new OnlineReviewDialog(
                         javax.swing.SwingUtilities.getWindowAncestor(TeacherPanel.this),
-                        original,
-                        submission.getOnlineReviewContent(),
-                        submission.getTeacherNote()
+                        rich,
+                        submission.getTeacherNote(),
+                        editable,
+                        lockedBy
                     );
                     dialog.setVisible(true);
-                    if (dialog.isSaved()) {
-                        saveOnlineReview(submission, dialog.getReviewContent(), dialog.getNote());
+                    if (editable) {
+                        if (dialog.isSaved()) {
+                            String richToSave = dialog.getRichContent();
+                            String note = dialog.getNote();
+                            saveOnlineReview(submission, richToSave, note.isEmpty() ? null : note);
+                        } else {
+                            submissionService.releaseOnlineEditLock(submission, "TEACHER", teacher.getUsername());
+                        }
                     }
                 } catch (Exception ex) {
                     JOptionPane.showMessageDialog(TeacherPanel.this, "加载失败: " + ex.getMessage(), "提示", JOptionPane.WARNING_MESSAGE);
+                    if (lockedBy == null) {
+                        submissionService.releaseOnlineEditLock(submission, "TEACHER", teacher.getUsername());
+                    }
                 } finally {
                     statusLabel.setText("欢迎，" + teacher.getDisplayName());
                 }
@@ -178,12 +200,12 @@ public class TeacherPanel extends JPanel {
         }.execute();
     }
 
-    private void saveOnlineReview(Submission submission, String content, String note) {
+    private void saveOnlineReview(Submission submission, String richContent, String note) {
         statusLabel.setText("正在保存在线批改...");
         new SwingWorker<Void, Void>() {
             @Override
             protected Void doInBackground() throws Exception {
-                submissionService.saveOnlineReview(submission, content, note.isEmpty() ? null : note);
+                submissionService.saveOnlineReview(submission, richContent, note);
                 return null;
             }
 
@@ -196,6 +218,7 @@ public class TeacherPanel extends JPanel {
                 } catch (Exception ex) {
                     JOptionPane.showMessageDialog(TeacherPanel.this, "保存失败: " + ex.getMessage(), "提示", JOptionPane.WARNING_MESSAGE);
                 } finally {
+                    submissionService.releaseOnlineEditLock(submission, "TEACHER", teacher.getUsername());
                     statusLabel.setText("欢迎，" + teacher.getDisplayName());
                 }
             }

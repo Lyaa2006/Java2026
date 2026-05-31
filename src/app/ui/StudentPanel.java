@@ -100,6 +100,37 @@ public class StudentPanel extends JPanel {
         if (submission == null) {
             return;
         }
+        if (submissionService.isTextSubmission(submission) && submission.getOnlineReviewContent() != null && !submission.getOnlineReviewContent().isBlank()) {
+            JFileChooser chooser = new JFileChooser();
+            File source = submissionService.getSubmissionFile(submission);
+            chooser.setSelectedFile(new File(source == null ? "edited.txt" : source.getName()));
+            if (chooser.showSaveDialog(this) != JFileChooser.APPROVE_OPTION) {
+                return;
+            }
+            File target = chooser.getSelectedFile();
+            statusLabel.setText("正在下载编辑后的文本...");
+            new SwingWorker<Void, Void>() {
+                @Override
+                protected Void doInBackground() throws Exception {
+                    String content = submissionService.exportOnlineEditablePlainText(submission);
+                    app.util.FileUtils.writeText(target, content);
+                    return null;
+                }
+
+                @Override
+                protected void done() {
+                    try {
+                        get();
+                        JOptionPane.showMessageDialog(StudentPanel.this, "下载完成", "提示", JOptionPane.INFORMATION_MESSAGE);
+                    } catch (Exception ex) {
+                        JOptionPane.showMessageDialog(StudentPanel.this, "下载失败: " + ex.getMessage(), "提示", JOptionPane.WARNING_MESSAGE);
+                    } finally {
+                        statusLabel.setText("欢迎，" + student.getDisplayName());
+                    }
+                }
+            }.execute();
+            return;
+        }
         File reviewFile = submissionService.getReviewFile(submission);
         if (reviewFile == null || !reviewFile.exists()) {
             JOptionPane.showMessageDialog(this, "暂无批改文件", "提示", JOptionPane.INFORMATION_MESSAGE);
@@ -144,80 +175,61 @@ public class StudentPanel extends JPanel {
     }
 
     private void openOnlineReview() {
-        Submission submission = getSelectedSubmission();
-        if (submission == null) {
-            return;
-        }
-        if (!submissionService.isTextSubmission(submission)) {
-            JOptionPane.showMessageDialog(this, "当前文件类型不支持在线查看", "提示", JOptionPane.INFORMATION_MESSAGE);
-            return;
-        }
-        if (submission.getOnlineReviewContent() == null || submission.getOnlineReviewContent().isBlank()) {
-            JOptionPane.showMessageDialog(this, "教师尚未在线批改", "提示", JOptionPane.INFORMATION_MESSAGE);
-            return;
-        }
-        statusLabel.setText("正在加载批改内容...");
-        new SwingWorker<String, Void>() {
-            @Override
-            protected String doInBackground() throws Exception {
-                return submissionService.loadSubmissionText(submission);
-            }
-
-            @Override
-            protected void done() {
-                try {
-                    String original = get();
-                    OnlineReviewViewerDialog dialog = new OnlineReviewViewerDialog(
-                        javax.swing.SwingUtilities.getWindowAncestor(StudentPanel.this),
-                        original,
-                        submission.getOnlineReviewContent()
-                    );
-                    dialog.setVisible(true);
-                } catch (Exception ex) {
-                    JOptionPane.showMessageDialog(StudentPanel.this, "加载失败: " + ex.getMessage(), "提示", JOptionPane.WARNING_MESSAGE);
-                } finally {
-                    statusLabel.setText("欢迎，" + student.getDisplayName());
-                }
-            }
-        }.execute();
+        openOnlineEditor();
     }
 
     private void openOnlineCorrection() {
+        openOnlineEditor();
+    }
+
+    private void openOnlineEditor() {
         Submission submission = getSelectedSubmission();
         if (submission == null) {
             return;
         }
         if (!submissionService.isTextSubmission(submission)) {
-            JOptionPane.showMessageDialog(this, "当前文件类型不支持在线订正", "提示", JOptionPane.INFORMATION_MESSAGE);
+            JOptionPane.showMessageDialog(this, "当前文件类型不支持在线编辑", "提示", JOptionPane.INFORMATION_MESSAGE);
             return;
         }
-        if (submission.getOnlineReviewContent() == null || submission.getOnlineReviewContent().isBlank()) {
-            JOptionPane.showMessageDialog(this, "请先等待教师在线批改", "提示", JOptionPane.INFORMATION_MESSAGE);
-            return;
-        }
-        statusLabel.setText("正在打开订正界面...");
-        new SwingWorker<String, Void>() {
+        statusLabel.setText("正在打开在线编辑界面...");
+        new SwingWorker<Object[], Void>() {
             @Override
-            protected String doInBackground() throws Exception {
-                return submissionService.loadSubmissionText(submission);
+            protected Object[] doInBackground() throws Exception {
+                String original = submissionService.loadSubmissionText(submission);
+                String rich = submissionService.ensureOnlineEditableContent(submission, original);
+                String lockedBy = submissionService.tryAcquireOnlineEditLock(submission, "STUDENT", student.getUsername());
+                return new Object[]{rich, lockedBy};
             }
 
             @Override
             protected void done() {
+                String lockedBy = null;
                 try {
-                    String original = get();
+                    Object[] data = get();
+                    String rich = (String) data[0];
+                    lockedBy = (String) data[1];
+                    boolean editable = lockedBy == null;
                     OnlineCorrectionDialog dialog = new OnlineCorrectionDialog(
                         javax.swing.SwingUtilities.getWindowAncestor(StudentPanel.this),
-                        original,
-                        submission.getOnlineReviewContent(),
-                        submission.getOnlineStudentFixContent()
+                        rich,
+                        submission.getTeacherNote(),
+                        editable,
+                        lockedBy
                     );
                     dialog.setVisible(true);
-                    if (dialog.isSaved()) {
-                        saveStudentCorrection(submission, dialog.getCorrectionContent());
+                    if (editable) {
+                        if (dialog.isSaved()) {
+                            String richToSave = dialog.getRichContent();
+                            saveStudentCorrection(submission, richToSave);
+                        } else {
+                            submissionService.releaseOnlineEditLock(submission, "STUDENT", student.getUsername());
+                        }
                     }
                 } catch (Exception ex) {
                     JOptionPane.showMessageDialog(StudentPanel.this, "加载失败: " + ex.getMessage(), "提示", JOptionPane.WARNING_MESSAGE);
+                    if (lockedBy == null) {
+                        submissionService.releaseOnlineEditLock(submission, "STUDENT", student.getUsername());
+                    }
                 } finally {
                     statusLabel.setText("欢迎，" + student.getDisplayName());
                 }
@@ -225,12 +237,12 @@ public class StudentPanel extends JPanel {
         }.execute();
     }
 
-    private void saveStudentCorrection(Submission submission, String content) {
-        statusLabel.setText("正在提交订正...");
+    private void saveStudentCorrection(Submission submission, String richContent) {
+        statusLabel.setText("正在保存...");
         new SwingWorker<Void, Void>() {
             @Override
             protected Void doInBackground() throws Exception {
-                submissionService.saveStudentCorrection(submission, content);
+                submissionService.saveStudentCorrection(submission, richContent);
                 return null;
             }
 
@@ -238,11 +250,12 @@ public class StudentPanel extends JPanel {
             protected void done() {
                 try {
                     get();
-                    JOptionPane.showMessageDialog(StudentPanel.this, "订正已提交", "提示", JOptionPane.INFORMATION_MESSAGE);
+                    JOptionPane.showMessageDialog(StudentPanel.this, "已保存", "提示", JOptionPane.INFORMATION_MESSAGE);
                     refreshList();
                 } catch (Exception ex) {
-                    JOptionPane.showMessageDialog(StudentPanel.this, "提交失败: " + ex.getMessage(), "提示", JOptionPane.WARNING_MESSAGE);
+                    JOptionPane.showMessageDialog(StudentPanel.this, "保存失败: " + ex.getMessage(), "提示", JOptionPane.WARNING_MESSAGE);
                 } finally {
+                    submissionService.releaseOnlineEditLock(submission, "STUDENT", student.getUsername());
                     statusLabel.setText("欢迎，" + student.getDisplayName());
                 }
             }

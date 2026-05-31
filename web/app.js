@@ -1,5 +1,7 @@
 import {
   ensureDefaults,
+  ensureOnlineEditableContent,
+  exportPlainTextFromRich,
   getFileRecord,
   getUser,
   isTextFileName,
@@ -8,12 +10,10 @@ import {
   loadSubmissionOriginalText,
   loginUser,
   registerUser,
-  saveOriginalTextFile,
   saveOnlineReview,
   saveStudentCorrection,
   statusLabel,
   submitAssignment,
-  updateSubmissionDraft,
   uploadReviewFile,
 } from "./storage.js";
 
@@ -658,6 +658,11 @@ function buildSubmissionTable(submissions, { role }) {
 }
 
 async function onDownloadOriginal(submission) {
+  if (isTextFileName(submission.fileName) && submission.onlineReviewContent) {
+    const plain = exportPlainTextFromRich(submission.onlineReviewContent);
+    downloadBlob({ blob: new Blob([plain], { type: "text/plain;charset=utf-8" }), fileName: submission.fileName });
+    return;
+  }
   const fileRecord = await getFileRecord(submission.originalFileKey);
   if (!fileRecord?.blob) {
     openModal({
@@ -671,6 +676,11 @@ async function onDownloadOriginal(submission) {
 }
 
 async function onDownloadReviewFile(submission) {
+  if (isTextFileName(submission.fileName) && submission.onlineReviewContent) {
+    const plain = exportPlainTextFromRich(submission.onlineReviewContent);
+    downloadBlob({ blob: new Blob([plain], { type: "text/plain;charset=utf-8" }), fileName: submission.fileName });
+    return;
+  }
   if (!submission.reviewFileKey) {
     openModal({
       title: "下载批改文件",
@@ -692,6 +702,11 @@ async function onDownloadReviewFile(submission) {
 }
 
 async function onDownloadRevisedFile(submission) {
+  if (isTextFileName(submission.fileName) && submission.onlineReviewContent) {
+    const plain = exportPlainTextFromRich(submission.onlineReviewContent);
+    downloadBlob({ blob: new Blob([plain], { type: "text/plain;charset=utf-8" }), fileName: submission.fileName });
+    return;
+  }
   if (!submission.revisedFileKey) {
     openModal({
       title: "下载订正文件",
@@ -910,335 +925,231 @@ function createLineEditor({ submissionId, doc, initialText, readOnly, onSelectLi
 
 async function openTextWorkspace({ submission, originalText, defaultTab }) {
   const role = currentUser?.role || "";
-  const canEditOriginal = role === "教师" || role === "学生";
-  const canEditReview = role === "教师";
-  const canEditCorrection = role === "学生";
-
-  let active = defaultTab || (canEditReview ? "review" : canEditCorrection ? "correction" : "original");
-  let teacherNote = submission.teacherNote || "";
-  let lineNotes = submission.lineNotes && typeof submission.lineNotes === "object" ? submission.lineNotes : {};
-
-  let originalTextWorking = String(originalText ?? "");
-
-  async function loadTextFromFileKey(fileKey) {
-    const record = await getFileRecord(fileKey);
-    if (!record?.blob) return null;
-    try {
-      return await record.blob.text();
-    } catch {
-      return null;
-    }
-  }
-
-  let reviewText = submission.onlineReviewContent;
-  if (reviewText == null && submission.reviewFileKey) {
-    reviewText = await loadTextFromFileKey(submission.reviewFileKey);
-  }
-  if (reviewText == null) {
-    reviewText = originalTextWorking;
-  }
-
-  let correctionText = submission.onlineStudentFixContent;
-  if (correctionText == null && submission.revisedFileKey) {
-    correctionText = await loadTextFromFileKey(submission.revisedFileKey);
-  }
-  if (correctionText == null) {
-    correctionText = originalTextWorking;
-  }
+  const canEditFile = role === "教师" || role === "学生";
+  const canEditNote = role === "教师";
+  const roleSrc = role === "教师" ? "T" : "S";
 
   const statusBar = el("div", { class: "hint" });
+  const lockResult = canEditFile
+    ? collab.acquire({ submissionId: submission.id, doc: "file", line: 0, ownerLabel: `${currentUser.role}:${currentUser.username}` })
+    : { ok: false, ownerLabel: "未登录" };
+  const editable = !!lockResult.ok;
 
-  const saveDraft = debounce(async (patch) => {
-    try {
-      await updateSubmissionDraft({ submissionId: submission.id, patch });
-    } catch (err) {
-      statusBar.textContent = err?.message || "保存失败";
+  const { submission: latestSubmission, richContent } = await ensureOnlineEditableContent({ submissionId: submission.id });
+
+  function encodeUtf8ToBase64(text) {
+    const bytes = new TextEncoder().encode(String(text ?? ""));
+    let binary = "";
+    for (let i = 0; i < bytes.length; i += 1) binary += String.fromCharCode(bytes[i]);
+    return btoa(binary);
+  }
+
+  function parseRichToSegments(content) {
+    const raw = String(content ?? "");
+    if (!raw.startsWith("RICH1\n")) return [{ src: "O", text: raw }];
+    const lines = raw.split("\n");
+    const segments = [];
+    for (let i = 1; i < lines.length; i += 1) {
+      const line = lines[i];
+      if (!line) continue;
+      const idx = line.indexOf(":");
+      if (idx <= 0) continue;
+      const src = line.slice(0, idx) || "O";
+      const payload = line.slice(idx + 1);
+      if (!payload) continue;
+      segments.push({ src: src[0] || "O", text: exportPlainTextFromRich(`RICH1\n${src[0]}:${payload}\n`) });
     }
-  }, 350);
-
-  function lineNoAt(text, index) {
-    const s = String(text ?? "");
-    const idx = Math.max(0, Math.min(Number(index) || 0, s.length));
-    let line = 1;
-    for (let i = 0; i < idx; i += 1) {
-      if (s.charCodeAt(i) === 10) line += 1;
-    }
-    return line;
+    if (!segments.length) segments.push({ src: "O", text: "" });
+    return segments;
   }
 
-  function selectionLineRange(text, start, end) {
-    const a = lineNoAt(text, start);
-    const b = lineNoAt(text, end);
-    return [Math.min(a, b), Math.max(a, b)];
+  function spanForSegment(seg) {
+    const span = document.createElement("span");
+    span.dataset.src = seg.src;
+    span.className = seg.src === "T" ? "seg-teacher" : seg.src === "S" ? "seg-student" : "seg-original";
+    span.textContent = seg.text || "";
+    return span;
   }
 
-  function getLineNote(lineNo) {
-    const key = String(lineNo);
-    const entry = lineNotes[key] && typeof lineNotes[key] === "object" ? lineNotes[key] : {};
-    return {
-      teacher: String(entry.teacher ?? ""),
-      student: String(entry.student ?? ""),
-    };
-  }
-
-  function setLineNote(lineNo, patch) {
-    const key = String(lineNo);
-    const current = getLineNote(lineNo);
-    lineNotes = {
-      ...lineNotes,
-      [key]: { ...current, ...patch },
-    };
-    saveDraft({ lineNotes });
-  }
-
-  function getOwnerLabel() {
-    if (!currentUser) return "未知用户";
-    return `${currentUser.role}:${currentUser.username}`;
-  }
-
-  let heldLockKeys = new Set();
-  let lockDoc = active === "original" ? "original" : active === "review" ? "review" : active === "correction" ? "correction" : null;
-
-  function releaseLocks() {
-    for (const key of heldLockKeys) collab.releaseKey(key);
-    heldLockKeys = new Set();
-  }
-
-  function ensureLocksForRange({ doc, startLine, endLine }) {
-    const span = endLine - startLine + 1;
-    if (span > 200) {
-      return { ok: false, reason: "选区过大，请缩小选区后再编辑" };
-    }
-
-    const needed = new Set();
-    for (let line = startLine; line <= endLine; line += 1) {
-      needed.add(collab.lockKey({ submissionId: submission.id, doc, line }));
-    }
-
-    for (const key of heldLockKeys) {
-      if (!needed.has(key)) collab.releaseKey(key);
-    }
-
-    const nextHeld = new Set();
-    for (const key of needed) {
-      if (heldLockKeys.has(key)) {
-        nextHeld.add(key);
-        continue;
+  function normalizeEditor(editor) {
+    const children = Array.from(editor.childNodes);
+    const spans = [];
+    for (const node of children) {
+      if (node.nodeType === 3) {
+        const text = node.nodeValue || "";
+        const span = spanForSegment({ src: "O", text });
+        spans.push(span);
+      } else if (node.nodeType === 1 && node.tagName === "SPAN") {
+        const src = node.dataset?.src || "O";
+        spans.push(spanForSegment({ src, text: node.textContent || "" }));
       }
-
-      const parts = String(key).split("|");
-      const line = Number(parts[2] || 1);
-      const result = collab.acquire({ submissionId: submission.id, doc, line, ownerLabel: getOwnerLabel() });
-      if (!result.ok) {
-        for (const acquired of nextHeld) {
-          if (!heldLockKeys.has(acquired)) collab.releaseKey(acquired);
-        }
-        return { ok: false, reason: `第 ${line} 行正在被 ${result.ownerLabel} 编辑` };
-      }
-      nextHeld.add(result.key);
     }
 
-    heldLockKeys = nextHeld;
-    return { ok: true };
-  }
-
-  function isEditableActive() {
-    if (active === "original") return canEditOriginal;
-    if (active === "review") return canEditReview;
-    if (active === "correction") return canEditCorrection;
-    return false;
-  }
-
-  function activeDocClass() {
-    if (active === "original") return "original";
-    if (active === "review") return "teacher";
-    return "student";
-  }
-
-  function getActiveText() {
-    if (active === "original") return originalTextWorking;
-    if (active === "review") return reviewText;
-    return correctionText;
-  }
-
-  function setActiveText(next) {
-    if (active === "original") {
-      originalTextWorking = String(next ?? "");
-    } else if (active === "review") {
-      reviewText = String(next ?? "");
-      saveDraft({ onlineReviewContent: reviewText });
-    } else if (active === "correction") {
-      correctionText = String(next ?? "");
-      saveDraft({ onlineStudentFixContent: correctionText });
+    const merged = [];
+    for (const s of spans) {
+      if (!s.textContent) continue;
+      const prev = merged[merged.length - 1];
+      if (prev && prev.dataset.src === s.dataset.src) prev.textContent += s.textContent;
+      else merged.push(s);
     }
+
+    editor.replaceChildren(...(merged.length ? merged : [spanForSegment({ src: "O", text: "" })]));
   }
 
-  let selectedLine = 1;
-
-  const notesHint = el("div", { class: "hint" });
-  const teacherLineNoteArea = el("textarea");
-  const studentLineNoteArea = el("textarea");
-  teacherLineNoteArea.style.minHeight = "100px";
-  studentLineNoteArea.style.minHeight = "100px";
-  teacherLineNoteArea.readOnly = !canEditReview;
-  studentLineNoteArea.readOnly = !canEditCorrection;
-
-  teacherLineNoteArea.addEventListener("input", () => setLineNote(selectedLine, { teacher: teacherLineNoteArea.value }));
-  studentLineNoteArea.addEventListener("input", () => setLineNote(selectedLine, { student: studentLineNoteArea.value }));
-
-  const teacherNoteArea = el("textarea");
-  teacherNoteArea.value = teacherNote;
-  teacherNoteArea.style.minHeight = "110px";
-  teacherNoteArea.readOnly = !canEditReview;
-  teacherNoteArea.addEventListener("input", () => {
-    teacherNote = teacherNoteArea.value;
-    saveDraft({ teacherNote });
-  });
-
-  function syncNotesUI() {
-    notesHint.textContent = `旁注：当前第 ${selectedLine} 行`;
-    const note = getLineNote(selectedLine);
-    teacherLineNoteArea.value = note.teacher;
-    studentLineNoteArea.value = note.student;
+  function findSpanInEditor(editor, node) {
+    if (!node) return null;
+    if (node.nodeType === 1 && node.tagName === "SPAN") return editor.contains(node) ? node : null;
+    if (node.nodeType === 3) {
+      const p = node.parentElement;
+      if (p && p.tagName === "SPAN" && editor.contains(p)) return p;
+    }
+    const elNode = node.nodeType === 1 ? node : node.parentElement;
+    const span = elNode?.closest?.("span");
+    return span && editor.contains(span) ? span : null;
   }
 
-  const tabs = el("div", { class: "tabs" });
-  const tabItems = [
-    { key: "original", label: "原始作业", tagText: "蓝色" },
-    { key: "review", label: "老师批改", tagText: "绿色" },
-    { key: "correction", label: "学生订正", tagText: "橙色" },
-  ];
-
-  const editorArea = el("textarea", { class: `code-area ${activeDocClass()}`, spellcheck: "false" });
-
-  function syncSelectedLineFromCursor() {
-    const text = editorArea.value;
-    const start = editorArea.selectionStart ?? 0;
-    selectedLine = lineNoAt(text, start);
-    syncNotesUI();
+  function setCaretAtStart(node) {
+    const sel = window.getSelection();
+    if (!sel) return;
+    const range = document.createRange();
+    range.selectNodeContents(node);
+    range.collapse(true);
+    sel.removeAllRanges();
+    sel.addRange(range);
   }
 
-  function setActiveTab(nextActive) {
-    if (active === nextActive) return;
-    active = nextActive;
-    lockDoc = active === "original" ? "original" : active === "review" ? "review" : active === "correction" ? "correction" : null;
-    releaseLocks();
-    redrawTabs();
-    redrawEditor();
-    syncSelectedLineFromCursor();
-    statusBar.textContent = "";
-    updateLeftPaneChrome();
+  function setCaretAtEnd(node) {
+    const sel = window.getSelection();
+    if (!sel) return;
+    const range = document.createRange();
+    range.selectNodeContents(node);
+    range.collapse(false);
+    sel.removeAllRanges();
+    sel.addRange(range);
   }
 
-  function redrawTabs() {
-    [...tabs.querySelectorAll(".tab")].forEach((btn) => btn.classList.remove("active"));
-    tabs.querySelector(`[data-tab="${active}"]`)?.classList.add("active");
-  }
+  function ensureRoleSpanAtCaret(editor) {
+    const sel = window.getSelection();
+    if (!sel || !sel.rangeCount) return;
+    const range = sel.getRangeAt(0);
+    if (!editor.contains(range.startContainer)) return;
 
-  for (const item of tabItems) {
-    tabs.append(
-      el(
-        "button",
-        {
-          class: `tab ${active === item.key ? "active" : ""}`,
-          type: "button",
-          "data-tab": item.key,
-          onClick: () => setActiveTab(item.key),
-        },
-        item.label
-      )
-    );
-  }
-
-  function redrawEditor() {
-    editorArea.className = `code-area ${activeDocClass()}`;
-    editorArea.readOnly = !isEditableActive();
-    editorArea.value = getActiveText();
-  }
-
-  editorArea.addEventListener("beforeinput", (event) => {
-    if (!isEditableActive()) {
-      event.preventDefault();
+    const span = findSpanInEditor(editor, range.startContainer);
+    if (!span) {
+      const roleSpan = spanForSegment({ src: roleSrc, text: "" });
+      const offset = range.startOffset || 0;
+      const ref = editor.childNodes[offset] || null;
+      editor.insertBefore(roleSpan, ref);
+      setCaretAtStart(roleSpan);
       return;
     }
-    if (!lockDoc) return;
-    const [startLine, endLine] = selectionLineRange(editorArea.value, editorArea.selectionStart, editorArea.selectionEnd);
-    const result = ensureLocksForRange({ doc: lockDoc, startLine, endLine });
-    if (!result.ok) {
-      event.preventDefault();
-      statusBar.textContent = result.reason || "该行不可编辑";
-      return;
+    if (span.dataset.src === roleSrc) return;
+
+    const spanRange = range.cloneRange();
+    spanRange.selectNodeContents(span);
+    spanRange.setEnd(range.startContainer, range.startOffset);
+    const pos = spanRange.toString().length;
+    const full = span.textContent || "";
+    const leftText = full.slice(0, pos);
+    const rightText = full.slice(pos);
+
+    const parts = [];
+    if (leftText) parts.push(spanForSegment({ src: span.dataset.src, text: leftText }));
+    const roleSpan = spanForSegment({ src: roleSrc, text: "" });
+    parts.push(roleSpan);
+    if (rightText) parts.push(spanForSegment({ src: span.dataset.src, text: rightText }));
+
+    span.replaceWith(...parts);
+    setCaretAtStart(roleSpan);
+  }
+
+  function editorToRich(editor) {
+    const runs = [];
+    for (const node of Array.from(editor.childNodes)) {
+      if (node.nodeType !== 1 || node.tagName !== "SPAN") continue;
+      const src = node.dataset?.src || "O";
+      const text = node.textContent || "";
+      if (!text) continue;
+      const prev = runs[runs.length - 1];
+      if (prev && prev.src === src) prev.text += text;
+      else runs.push({ src, text });
     }
-    statusBar.textContent = `已锁定第 ${startLine}${startLine === endLine ? "" : `~${endLine}`} 行`;
-  });
+    let rich = "RICH1\n";
+    for (const run of runs.length ? runs : [{ src: "O", text: "" }]) {
+      rich += `${run.src}:${encodeUtf8ToBase64(run.text)}\n`;
+    }
+    return rich;
+  }
 
-  editorArea.addEventListener("input", () => {
-    setActiveText(editorArea.value);
-    syncSelectedLineFromCursor();
-  });
+  const editor = el("div", { class: "rich-editor" });
+  editor.contentEditable = editable ? "true" : "false";
+  editor.spellcheck = false;
+  editor.append(...parseRichToSegments(richContent).map(spanForSegment));
+  normalizeEditor(editor);
 
-  editorArea.addEventListener("keyup", syncSelectedLineFromCursor);
-  editorArea.addEventListener("mouseup", syncSelectedLineFromCursor);
-  editorArea.addEventListener("select", syncSelectedLineFromCursor);
+  if (editable) {
+    editor.addEventListener("compositionstart", () => ensureRoleSpanAtCaret(editor));
+    editor.addEventListener("beforeinput", (event) => {
+      if (!editable) {
+        event.preventDefault();
+        return;
+      }
+      if (event.inputType === "insertParagraph") {
+        event.preventDefault();
+        ensureRoleSpanAtCaret(editor);
+        document.execCommand("insertText", false, "\n");
+        normalizeEditor(editor);
+        return;
+      }
+      if (String(event.inputType || "").startsWith("insert")) {
+        ensureRoleSpanAtCaret(editor);
+      }
+      setTimeout(() => normalizeEditor(editor), 0);
+    });
+    editor.addEventListener("paste", (event) => {
+      if (!event.clipboardData) return;
+      event.preventDefault();
+      ensureRoleSpanAtCaret(editor);
+      const text = event.clipboardData.getData("text/plain");
+      document.execCommand("insertText", false, text);
+      normalizeEditor(editor);
+    });
+  }
 
-  editorArea.addEventListener("blur", () => {
-    releaseLocks();
-    statusBar.textContent = "";
-  });
+  const noteArea = el("textarea");
+  noteArea.value = latestSubmission.teacherNote || "";
+  noteArea.readOnly = !canEditNote;
+  noteArea.style.minHeight = "140px";
 
-  redrawEditor();
-  syncNotesUI();
-
+  const leftTitle = editable
+    ? "文件内容（可编辑）"
+    : `文件内容（只读：对方正在编辑 ${lockResult.ownerLabel || "其他用户"}）`;
   const leftPane = buildPane({
-    title: "文件内容",
-    tagText: active === "original" ? "蓝色" : active === "review" ? "绿色" : "橙色",
-    paneClass: active === "original" ? "original" : active === "review" ? "teacher" : "student",
-    contentNode: el("div", null, el("div", { class: "row-between" }, tabs, el("div", { class: "pill" }, "锁：同站点多标签页可体验")), el("div", { style: "margin-top:10px" }, editorArea)),
+    title: leftTitle,
+    tagText: "黑/红/蓝",
+    paneClass: "original",
+    contentNode: el("div", null, editor, statusBar),
   });
-
-  const leftPaneTag = leftPane.querySelector(".pane-tag");
-  function updateLeftPaneChrome() {
-    if (leftPaneTag) {
-      leftPaneTag.textContent = active === "original" ? "蓝色" : active === "review" ? "绿色" : "橙色";
-    }
-    leftPane.classList.remove("original", "teacher", "student");
-    leftPane.classList.add(active === "original" ? "original" : active === "review" ? "teacher" : "student");
-  }
-
-  updateLeftPaneChrome();
 
   const rightPane = buildPane({
-    title: "旁注",
-    tagText: "按行",
+    title: canEditNote ? "评语（教师可编辑）" : "评语（仅查看）",
+    tagText: "评语",
     paneClass: "student",
-    contentNode: el(
-      "div",
-      null,
-      notesHint,
-      el("div", { class: "form-row" }, el("label", { text: "旁注（教师）" }), teacherLineNoteArea),
-      el("div", { class: "form-row" }, el("label", { text: "旁注（学生）" }), studentLineNoteArea),
-      el("div", { class: "form-row" }, el("label", { text: "教师总批注" }), teacherNoteArea),
-      statusBar
-    ),
+    contentNode: el("div", null, el("div", { class: "form-row" }, el("label", { text: "教师评语" }), noteArea)),
   });
 
   const body = el("div", { class: "split" }, leftPane, rightPane);
 
-  function cleanup() {
-    releaseLocks();
-    collab.releaseAllForSubmission(submission.id);
-  }
-
   modal.addEventListener(
     "close",
     () => {
-      cleanup();
+      if (lockResult?.ok) collab.releaseKey(lockResult.key);
     },
     { once: true }
   );
 
   const footerButtons = [el("button", { class: "btn", type: "button", onClick: closeModal }, "关闭")];
-  if (canEditOriginal) {
+  if (editable) {
     footerButtons.push(
       el(
         "button",
@@ -1247,27 +1158,12 @@ async function openTextWorkspace({ submission, originalText, defaultTab }) {
           type: "button",
           onClick: async () => {
             try {
-              await saveOriginalTextFile({ submissionId: submission.id, text: originalTextWorking });
-              statusBar.textContent = "已写入原始文件";
-            } catch (err) {
-              statusBar.textContent = err?.message || "写入失败";
-            }
-          },
-        },
-        "保存原文件"
-      )
-    );
-  }
-  if (canEditReview) {
-    footerButtons.push(
-      el(
-        "button",
-        {
-          class: "btn primary",
-          type: "button",
-          onClick: async () => {
-            try {
-              await saveOnlineReview({ submissionId: submission.id, reviewContent: reviewText, teacherNote });
+              const rich = editorToRich(editor);
+              if (role === "教师") {
+                await saveOnlineReview({ submissionId: submission.id, reviewContent: rich, teacherNote: noteArea.value });
+              } else {
+                await saveStudentCorrection({ submissionId: submission.id, correctionContent: rich });
+              }
               closeModal();
               render();
             } catch (err) {
@@ -1275,34 +1171,13 @@ async function openTextWorkspace({ submission, originalText, defaultTab }) {
             }
           },
         },
-        "保存批改"
-      )
-    );
-  }
-  if (canEditCorrection) {
-    footerButtons.push(
-      el(
-        "button",
-        {
-          class: "btn primary",
-          type: "button",
-          onClick: async () => {
-            try {
-              await saveStudentCorrection({ submissionId: submission.id, correctionContent: correctionText });
-              closeModal();
-              render();
-            } catch (err) {
-              statusBar.textContent = err?.message || "提交失败";
-            }
-          },
-        },
-        "提交订正"
+        "保存"
       )
     );
   }
 
   openModal({
-    title: "在线编辑（左侧编辑 / 右侧旁注）",
+    title: "在线查看/编辑",
     body,
     footerButtons,
   });
@@ -1318,18 +1193,7 @@ async function onTeacherOnlineReview(submission) {
     return;
   }
 
-  let originalText = "";
-  try {
-    originalText = await loadSubmissionOriginalText(submission);
-  } catch (err) {
-    openModal({
-      title: "在线批改",
-      body: showNotice({ type: "bad", text: err?.message || "加载失败" }),
-      footerButtons: [el("button", { class: "btn", type: "button", onClick: closeModal }, "关闭")],
-    });
-    return;
-  }
-  await openTextWorkspace({ submission, originalText, defaultTab: "review" });
+  await openTextWorkspace({ submission });
 }
 
 async function onStudentViewOnlineReview(submission) {
@@ -1342,18 +1206,7 @@ async function onStudentViewOnlineReview(submission) {
     return;
   }
 
-  let originalText = "";
-  try {
-    originalText = await loadSubmissionOriginalText(submission);
-  } catch (err) {
-    openModal({
-      title: "在线查看批改",
-      body: showNotice({ type: "bad", text: err?.message || "加载失败" }),
-      footerButtons: [el("button", { class: "btn", type: "button", onClick: closeModal }, "关闭")],
-    });
-    return;
-  }
-  await openTextWorkspace({ submission, originalText, defaultTab: "review" });
+  await openTextWorkspace({ submission });
 }
 
 async function onStudentOnlineCorrection(submission) {
@@ -1366,18 +1219,7 @@ async function onStudentOnlineCorrection(submission) {
     return;
   }
 
-  let originalText = "";
-  try {
-    originalText = await loadSubmissionOriginalText(submission);
-  } catch (err) {
-    openModal({
-      title: "在线订正",
-      body: showNotice({ type: "bad", text: err?.message || "加载失败" }),
-      footerButtons: [el("button", { class: "btn", type: "button", onClick: closeModal }, "关闭")],
-    });
-    return;
-  }
-  await openTextWorkspace({ submission, originalText, defaultTab: "correction" });
+  await openTextWorkspace({ submission });
 }
 
 function onUploadReviewFile(submission) {

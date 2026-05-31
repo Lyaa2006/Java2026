@@ -431,3 +431,35 @@ td {
     grid-template-columns: 1fr;
   }
 }
+
+.rich-editor {
+  min-height: 340px;
+  padding: 10px 12px;
+  border-radius: 10px;
+  border: 1px solid rgba(0, 0, 0, 0.16);
+  background: #ffffff;
+  color: #000000;
+  font-family: ui-monospace, SFMono-Regular, Menlo, Monaco, Consolas, "Liberation Mono", "Courier New", monospace;
+  font-size: 13px;
+  line-height: 1.5;
+  white-space: pre;
+  overflow: auto;
+  outline: none;
+  caret-color: #000000;
+}
+
+.rich-editor[contenteditable="true"]:focus {
+  box-shadow: inset 0 0 0 1px rgba(90, 139, 255, 0.45);
+}
+
+.seg-original {
+  color: #000000;
+}
+
+.seg-teacher {
+  color: #d00000;
+}
+
+.seg-student {
+  color: #0058dc;
+}

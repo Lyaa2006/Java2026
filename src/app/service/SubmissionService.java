@@ -18,6 +18,14 @@ public interface SubmissionService {
 
     String loadSubmissionText(Submission submission) throws Exception;
 
+    String ensureOnlineEditableContent(Submission submission, String originalContent) throws Exception;
+
+    String exportOnlineEditablePlainText(Submission submission) throws Exception;
+
+    String tryAcquireOnlineEditLock(Submission submission, String role, String username) throws Exception;
+
+    void releaseOnlineEditLock(Submission submission, String role, String username);
+
     void saveOnlineReview(Submission submission, String reviewedContent, String teacherNote) throws Exception;
 
     void saveStudentCorrection(Submission submission, String correctedContent) throws Exception;

@@ -1,72 +1,48 @@
-# 代码/作业互助批改平台（Java Swing 本地版）
+# 代码/作业互助批改平台（Web 本地存储版）
 
-本项目是一个纯 Java 本地运行的作业互助批改平台，包含学生端与教师端的完整流程闭环，覆盖 Java 核心技术（GUI、IO 流、集合框架、面向对象、异常处理、接口/抽象类、多线程）。
+本仓库当前提供一个无需后端的 Web 版本：所有数据与文件都存储在浏览器本地（IndexedDB），可以直接部署到 Netlify 作为静态站点给体验者使用。
 
-## 功能概览
+## Web 版功能概览
 
-- 双角色登录/注册
-- 学生端：作业上传、查看状态、下载批改文件
-- 教师端：查看提交列表、下载作业、上传批改文件并填写批注
-- 在线查看作业、在线批改与在线订正（支持 txt/java/md/csv）
-- 作业状态管理与消息提示
-- 统一文件管理与异常处理
+- 双角色登录/注册（内置默认教师账号）
+- 学生端：上传作业、查看状态、下载批改文件、在线订正
+- 教师端：查看提交列表、下载作业、上传批改文件并填写批注、在线批改
+- 在线编辑：左侧为文本内容编辑区，右侧为旁注区（按行关联）
+- 三色区分：原始作业/老师批改/学生订正
+- 行锁：同一站点下多标签页可演示“同一行不可同时编辑”
 
-## 模块说明
+## 数据与隐私说明（重要）
 
-- `app.Main`
-  - 程序入口，初始化外观并启动登录界面。
-- `app.AppContext`
-  - 应用上下文，集中管理服务实例。
-- `app.model`
-  - `User`（抽象类）：用户基类，封装用户名/密码/姓名等公共字段。
-  - `Student` / `Teacher`：学生与教师角色实体。
-  - `Submission`：作业提交记录，包含状态、批注与文件信息。
-  - `AssignmentStatus`：作业状态枚举。
-- `app.service`
-  - `UserService`（接口）：登录/注册服务。
-  - `UserServiceImpl`：用户校验与注册实现。
-  - `SubmissionService`（接口）：提交、查询、批改服务。
-  - `SubmissionServiceImpl`：作业文件管理与状态更新。
-  - `DataStore`：序列化持久化（用户与作业提交）。
-- `app.util.FileUtils`
-  - IO 流工具类，负责文件复制与目录创建。
-- `app.ui`
-  - `LoginFrame`：登录/注册界面。
-  - `DashboardFrame`：根据角色切换学生/教师工作台。
-  - `StudentPanel`：学生端上传、查看与下载。
-  - `TeacherPanel`：教师端列表、下载与批改回传。
-  - `SubmissionTableModel`：Swing 表格数据模型。
-  - `OnlineReviewDialog`：教师在线批改界面。
-  - `OnlineCorrectionDialog`：学生在线订正界面。
-  - `OnlineReviewViewerDialog`：学生在线查看批改界面。
+- 本 Web 版不包含服务器；数据不会写回仓库文件。
+- 数据按浏览器与站点域名隔离：同一台设备/同一浏览器/同一域名下会保留数据；其他用户不会看到你的本地数据。
+- 若需要清空体验数据：浏览器开发者工具 → Application/应用 → Storage → IndexedDB，删除站点数据即可。
 
-## 数据与文件说明
+## 本地运行（Web 版）
 
-- `data/users.dat`：用户数据（序列化保存）
-- `data/submissions.dat`：作业提交数据（序列化保存）
-- `data/submissions/<student>`：学生作业文件存储目录
-- `data/reviews/<student>`：教师批改文件存储目录
+前置要求：安装 Node.js（推荐 18+）。
 
-## 运行方式（Windows PowerShell）
-
-编译：
+在项目根目录启动一个静态服务器：
 
 ```powershell
-javac -encoding UTF-8 -d out (Get-ChildItem -Recurse -Filter *.java | ForEach-Object { $_.FullName })
+cd d:\JavaScript\期末大作业
+npx --yes http-server . -p 5173 -c-1
 ```
 
-运行：
+浏览器打开：
 
-```powershell
-java -cp out app.Main
-```
+- http://127.0.0.1:5173/
 
 ## 默认账号
 
 - 教师账号：`teacher` / `123456`
 
-## 说明
+## 模块架构（Web 版）
 
-- 所有文件均为本地 IO 读写，无需网络。
-- 上传/下载/回传操作通过 `SwingWorker` 在后台执行，保证界面响应。
-- 在线批改与订正仅支持纯文本类文件（txt/java/md/csv）。
+- 页面入口
+  - [index.html](file:///d:/JavaScript/%E6%9C%9F%E6%9C%AB%E5%A4%A7%E4%BD%9C%E4%B8%9A/index.html)：静态入口页面，加载样式与主脚本
+- 前端 UI/交互
+  - [app.js](file:///d:/JavaScript/%E6%9C%9F%E6%9C%AB%E5%A4%A7%E4%BD%9C%E4%B8%9A/web/app.js)：登录/注册、学生端/教师端、在线编辑（左侧编辑+右侧旁注）、行锁（同站点多标签页演示）
+- 本地数据层
+  - [storage.js](file:///d:/JavaScript/%E6%9C%9F%E6%9C%AB%E5%A4%A7%E4%BD%9C%E4%B8%9A/web/storage.js)：IndexedDB 封装（users/submissions/files），文件 Blob 存储与读取、提交/批改/订正/写回文件等业务接口
+- 样式
+  - [styles.css](file:///d:/JavaScript/%E6%9C%9F%E6%9C%AB%E5%A4%A7%E4%BD%9C%E4%B8%9A/web/styles.css)：整体 UI 与三色区分样式（原始/批改/订正）

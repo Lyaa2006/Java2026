@@ -1,15 +1,22 @@
 import {
+  createClass,
   ensureDefaults,
   ensureOnlineEditableContent,
   exportPlainTextFromRich,
   getFileRecord,
   getUser,
+  grantClassTeacherAccess,
   isTextFileName,
-  listAllSubmissions,
+  joinClass,
+  listClassesForStudent,
+  listClassesForTeacher,
+  listSubmissionsForTeacher,
   listSubmissionsForStudent,
+  listTeachers,
   loadSubmissionOriginalText,
   loginUser,
   registerUser,
+  revokeClassTeacherAccess,
   saveOnlineReview,
   saveStudentCorrection,
   statusLabel,
@@ -460,6 +467,8 @@ function renderDashboard() {
 function renderStudentPanel() {
   const msg = el("div");
   const fileInput = el("input", { type: "file", accept: ".pdf,.doc,.docx,.zip,.java,.txt,.md,.csv" });
+  const classSelect = el("select");
+  const classHint = el("div", { class: "hint" });
   const submitBtn = el(
     "button",
     {
@@ -469,7 +478,7 @@ function renderStudentPanel() {
         clear(msg);
         try {
           const file = fileInput.files?.[0];
-          await submitAssignment({ studentUser: currentUser, file });
+          await submitAssignment({ studentUser: currentUser, file, classId: classSelect.value });
           fileInput.value = "";
           msg.append(showNotice({ type: "ok", text: "上传成功" }));
           await refresh();
@@ -483,42 +492,273 @@ function renderStudentPanel() {
 
   const tableWrap = el("div");
 
+  async function refreshClasses() {
+    const classes = await listClassesForStudent(currentUser.username);
+    const joined = classes.filter((klass) => klass.joined);
+    clear(classSelect);
+    if (!joined.length) {
+      classSelect.append(el("option", { value: "", text: "请先加入班级" }));
+      classSelect.disabled = true;
+      classHint.textContent = "学生提交作业前必须先加入一个班级。";
+    } else {
+      classSelect.disabled = false;
+      for (const klass of joined) {
+        classSelect.append(el("option", { value: klass.id, text: klass.name }));
+      }
+      classHint.textContent = `已加入 ${joined.length} 个班级，提交结果仅该班有权限教师可见。`;
+    }
+  }
+
   async function refresh() {
     clear(tableWrap);
     const submissions = await listSubmissionsForStudent(currentUser.username);
     tableWrap.append(buildSubmissionTable(submissions, { role: "学生" }));
   }
 
+  refreshClasses();
   refresh();
 
   return el(
     "div",
     { class: "card" },
     el("div", { style: "font-weight:700; margin-bottom:10px" }, "学生端"),
-    el("div", { class: "row" }, el("div", { style: "min-width:320px; flex:1" }, fileInput), submitBtn, el("button", { class: "btn", type: "button", onClick: refresh }, "刷新")),
+    el(
+      "div",
+      { class: "row" },
+      el("div", { style: "min-width:220px; flex:1" }, el("label", { text: "提交班级" }), classSelect, classHint),
+      el("button", { class: "btn", type: "button", onClick: () => openJoinClassModal({ afterJoin: refreshClasses }) }, "加入班级")
+    ),
+    el(
+      "div",
+      { class: "row", style: "margin-top:12px" },
+      el("div", { style: "min-width:320px; flex:1" }, fileInput),
+      submitBtn,
+      el("button", { class: "btn", type: "button", onClick: refresh }, "刷新")
+    ),
     msg,
     el("div", { style: "margin-top:12px" }, tableWrap)
   );
 }
 
+async function openJoinClassModal({ afterJoin }) {
+  const body = el("div");
+  const msg = el("div");
+
+  async function redraw() {
+    clear(body);
+    const classes = await listClassesForStudent(currentUser.username);
+    if (!classes.length) {
+      body.append(showNotice({ type: "warn", text: "暂无可加入班级，请联系教师创建班级。" }));
+      return;
+    }
+    for (const klass of classes) {
+      const joined = !!klass.joined;
+      body.append(
+        el(
+          "div",
+          { class: "class-item" },
+          el(
+            "div",
+            null,
+            el("div", { style: "font-weight:700" }, klass.name),
+            el("div", { class: "muted" }, `创建教师：${klass.ownerName || klass.ownerUsername}`),
+            klass.description ? el("div", { class: "hint", text: klass.description }) : null
+          ),
+          el(
+            "button",
+            {
+              class: `btn small ${joined ? "" : "primary"}`,
+              type: "button",
+              disabled: joined,
+              onClick: async () => {
+                clear(msg);
+                try {
+                  await joinClass({ studentUser: currentUser, classId: klass.id });
+                  msg.append(showNotice({ type: "ok", text: "加入成功" }));
+                  if (afterJoin) await afterJoin();
+                  await redraw();
+                } catch (err) {
+                  msg.append(showNotice({ type: "bad", text: err?.message || "加入失败" }));
+                }
+              },
+            },
+            joined ? "已加入" : "加入"
+          )
+        )
+      );
+    }
+  }
+
+  await redraw();
+  openModal({
+    title: "加入班级",
+    body: el("div", null, body, msg),
+    footerButtons: [el("button", { class: "btn", type: "button", onClick: closeModal }, "关闭")],
+  });
+}
+
 function renderTeacherPanel() {
   const msg = el("div");
+  const classWrap = el("div");
   const tableWrap = el("div");
 
-  async function refresh() {
+  async function refreshSubmissions() {
     clear(tableWrap);
-    const submissions = await listAllSubmissions();
+    const submissions = await listSubmissionsForTeacher(currentUser.username);
     tableWrap.append(buildSubmissionTable(submissions, { role: "教师" }));
   }
 
-  refresh();
+  async function refreshClasses() {
+    clear(classWrap);
+    const [classes, teachers] = await Promise.all([listClassesForTeacher(currentUser.username), listTeachers()]);
+    classWrap.append(buildTeacherClassManager({ classes, teachers, onChanged: refreshAll }));
+  }
+
+  async function refreshAll() {
+    await Promise.all([refreshClasses(), refreshSubmissions()]);
+  }
+
+  refreshAll();
 
   return el(
     "div",
     { class: "card" },
-    el("div", { class: "row-between" }, el("div", { style: "font-weight:700" }, "教师端"), el("button", { class: "btn", type: "button", onClick: refresh }, "刷新")),
+    el("div", { class: "row-between" }, el("div", { style: "font-weight:700" }, "教师端"), el("button", { class: "btn", type: "button", onClick: refreshAll }, "刷新")),
     msg,
+    el("div", { style: "margin-top:12px" }, classWrap),
     el("div", { style: "margin-top:12px" }, tableWrap)
+  );
+}
+
+function buildTeacherClassManager({ classes, teachers, onChanged }) {
+  const nameInput = el("input", { placeholder: "例如：软件工程 1 班" });
+  const descInput = el("input", { placeholder: "班级说明（可选）" });
+  const msg = el("div");
+  const list = el("div", { class: "class-list" });
+  const teacherNames = new Map(teachers.map((t) => [t.username, t.displayName || t.username]));
+
+  function redrawList() {
+    clear(list);
+    if (!classes.length) {
+      list.append(showNotice({ type: "warn", text: "暂无可管理班级，请先创建班级。" }));
+      return;
+    }
+    for (const klass of classes) {
+      const isOwner = klass.ownerUsername === currentUser.username;
+      const authorized = klass.controllerUsernames || [];
+      const teacherSelect = el("select", null, el("option", { value: "", text: "选择教师授权" }));
+      for (const teacher of teachers) {
+        if (teacher.username === klass.ownerUsername || authorized.includes(teacher.username)) continue;
+        teacherSelect.append(el("option", { value: teacher.username, text: `${teacher.displayName}（${teacher.username}）` }));
+      }
+
+      const authList = authorized.length
+        ? authorized.map((username) =>
+            el(
+              "span",
+              { class: "pill" },
+              `${teacherNames.get(username) || username}（${username}）`,
+              isOwner
+                ? el(
+                    "button",
+                    {
+                      class: "inline-x",
+                      type: "button",
+                      title: "取消授权",
+                      onClick: async () => {
+                        clear(msg);
+                        try {
+                          await revokeClassTeacherAccess({ classId: klass.id, ownerUser: currentUser, teacherUsername: username });
+                          msg.append(showNotice({ type: "ok", text: "已取消授权" }));
+                          if (onChanged) await onChanged();
+                        } catch (err) {
+                          msg.append(showNotice({ type: "bad", text: err?.message || "取消授权失败" }));
+                        }
+                      },
+                    },
+                    "×"
+                  )
+                : null
+            )
+          )
+        : [el("span", { class: "muted", text: "暂无协作教师" })];
+
+      list.append(
+        el(
+          "div",
+          { class: "class-item" },
+          el(
+            "div",
+            null,
+            el("div", { style: "font-weight:700" }, klass.name),
+            el("div", { class: "muted" }, `创建教师：${klass.ownerName || klass.ownerUsername}；学生数：${(klass.memberUsernames || []).length}`),
+            klass.description ? el("div", { class: "hint", text: klass.description }) : null,
+            el("div", { class: "row", style: "margin-top:8px" }, el("span", { class: "muted", text: "控制权限：" }), authList)
+          ),
+          isOwner
+            ? el(
+                "div",
+                { class: "class-actions" },
+                teacherSelect,
+                el(
+                  "button",
+                  {
+                    class: "btn small primary",
+                    type: "button",
+                    onClick: async () => {
+                      clear(msg);
+                      try {
+                        await grantClassTeacherAccess({ classId: klass.id, ownerUser: currentUser, teacherUsername: teacherSelect.value });
+                        msg.append(showNotice({ type: "ok", text: "授权成功" }));
+                        if (onChanged) await onChanged();
+                      } catch (err) {
+                        msg.append(showNotice({ type: "bad", text: err?.message || "授权失败" }));
+                      }
+                    },
+                  },
+                  "授权"
+                )
+              )
+            : el("div", { class: "pill", text: "被授权管理" })
+        )
+      );
+    }
+  }
+
+  redrawList();
+
+  return el(
+    "div",
+    { class: "panel-section" },
+    el("div", { style: "font-weight:700; margin-bottom:10px" }, "班级与权限"),
+    el(
+      "div",
+      { class: "row" },
+      el("div", { style: "min-width:220px; flex:1" }, el("label", { text: "班级名称" }), nameInput),
+      el("div", { style: "min-width:260px; flex:1" }, el("label", { text: "说明" }), descInput),
+      el(
+        "button",
+        {
+          class: "btn primary",
+          type: "button",
+          onClick: async () => {
+            clear(msg);
+            try {
+              await createClass({ teacherUser: currentUser, name: nameInput.value, description: descInput.value });
+              nameInput.value = "";
+              descInput.value = "";
+              msg.append(showNotice({ type: "ok", text: "班级创建成功" }));
+              if (onChanged) await onChanged();
+            } catch (err) {
+              msg.append(showNotice({ type: "bad", text: err?.message || "创建失败" }));
+            }
+          },
+        },
+        "创建班级"
+      )
+    ),
+    msg,
+    list
   );
 }
 
@@ -537,6 +777,7 @@ function buildSubmissionTable(submissions, { role }) {
         null,
         el("th", { text: "编号" }),
         el("th", { text: "学生" }),
+        el("th", { text: "班级" }),
         el("th", { text: "文件" }),
         el("th", { text: "状态" }),
         el("th", { text: "提交时间" }),
@@ -645,6 +886,7 @@ function buildSubmissionTable(submissions, { role }) {
         null,
         el("td", { text: s.id.slice(0, 8) }),
         el("td", { text: `${s.studentName}（${s.studentUsername}）` }),
+        el("td", { text: s.className || "未分班" }),
         el("td", { text: s.fileName }),
         el("td", null, el("span", { class: "status", text: statusLabel(s.status) })),
         el("td", { text: formatTime(s.submitTime) }),
@@ -971,7 +1213,41 @@ async function openTextWorkspace({ submission, originalText, defaultTab }) {
     return span;
   }
 
+  function getCaretOffset(editor) {
+    const sel = window.getSelection();
+    if (!sel || !sel.rangeCount) return null;
+    const range = sel.getRangeAt(0);
+    if (!editor.contains(range.startContainer)) return null;
+    const prefix = range.cloneRange();
+    prefix.selectNodeContents(editor);
+    prefix.setEnd(range.startContainer, range.startOffset);
+    return prefix.toString().length;
+  }
+
+  function restoreCaretOffset(editor, offset) {
+    if (offset === null || offset === undefined) return;
+    const walker = document.createTreeWalker(editor, NodeFilter.SHOW_TEXT);
+    let remaining = offset;
+    let node = walker.nextNode();
+    while (node) {
+      const len = node.nodeValue.length;
+      if (remaining <= len) {
+        const range = document.createRange();
+        range.setStart(node, remaining);
+        range.collapse(true);
+        const sel = window.getSelection();
+        sel.removeAllRanges();
+        sel.addRange(range);
+        return;
+      }
+      remaining -= len;
+      node = walker.nextNode();
+    }
+    setCaretAtEnd(editor);
+  }
+
   function normalizeEditor(editor) {
+    const caretOffset = getCaretOffset(editor);
     const children = Array.from(editor.childNodes);
     const spans = [];
     for (const node of children) {
@@ -994,6 +1270,7 @@ async function openTextWorkspace({ submission, originalText, defaultTab }) {
     }
 
     editor.replaceChildren(...(merged.length ? merged : [spanForSegment({ src: "O", text: "" })]));
+    restoreCaretOffset(editor, caretOffset);
   }
 
   function findSpanInEditor(editor, node) {
@@ -1160,9 +1437,9 @@ async function openTextWorkspace({ submission, originalText, defaultTab }) {
             try {
               const rich = editorToRich(editor);
               if (role === "教师") {
-                await saveOnlineReview({ submissionId: submission.id, reviewContent: rich, teacherNote: noteArea.value });
+                await saveOnlineReview({ submissionId: submission.id, reviewContent: rich, teacherNote: noteArea.value, teacherUser: currentUser });
               } else {
-                await saveStudentCorrection({ submissionId: submission.id, correctionContent: rich });
+                await saveStudentCorrection({ submissionId: submission.id, correctionContent: rich, studentUser: currentUser });
               }
               closeModal();
               render();
@@ -1246,7 +1523,7 @@ function onUploadReviewFile(submission) {
           onClick: async () => {
             try {
               const file = reviewInput.files?.[0];
-              await uploadReviewFile({ submissionId: submission.id, reviewFile: file, teacherNote: noteArea.value });
+              await uploadReviewFile({ submissionId: submission.id, reviewFile: file, teacherNote: noteArea.value, teacherUser: currentUser });
               closeModal();
               render();
             } catch (err) {

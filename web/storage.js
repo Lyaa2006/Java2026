@@ -1,9 +1,10 @@
 const DB_NAME = "hw_review_platform";
-const DB_VERSION = 1;
+const DB_VERSION = 2;
 
 const STORE_USERS = "users";
 const STORE_SUBMISSIONS = "submissions";
 const STORE_FILES = "files";
+const STORE_CLASSES = "classes";
 
 export const AssignmentStatus = {
   SUBMITTED: { code: "SUBMITTED", label: "已提交" },
@@ -195,10 +196,21 @@ function openDb() {
         const store = db.createObjectStore(STORE_SUBMISSIONS, { keyPath: "id" });
         store.createIndex("byStudent", "studentUsername", { unique: false });
         store.createIndex("byTime", "submitTime", { unique: false });
+        store.createIndex("byClass", "classId", { unique: false });
+      } else {
+        const store = request.transaction.objectStore(STORE_SUBMISSIONS);
+        if (!store.indexNames.contains("byClass")) {
+          store.createIndex("byClass", "classId", { unique: false });
+        }
       }
 
       if (!db.objectStoreNames.contains(STORE_FILES)) {
         db.createObjectStore(STORE_FILES, { keyPath: "key" });
+      }
+
+      if (!db.objectStoreNames.contains(STORE_CLASSES)) {
+        const store = db.createObjectStore(STORE_CLASSES, { keyPath: "id" });
+        store.createIndex("byOwner", "ownerUsername", { unique: false });
       }
     };
     request.onsuccess = () => resolve(request.result);
@@ -222,16 +234,58 @@ function toSafeString(value) {
   return String(value ?? "").trim();
 }
 
+function uniqueStrings(values) {
+  return [...new Set((values || []).map(toSafeString).filter(Boolean))];
+}
+
+function publicUser(user) {
+  if (!user) return null;
+  return { ...user, password: undefined };
+}
+
+function hasTeacherClassAccess(classRecord, teacherUsername) {
+  const u = toSafeString(teacherUsername);
+  if (!classRecord || !u) return false;
+  return classRecord.ownerUsername === u || (classRecord.controllerUsernames || []).includes(u);
+}
+
+async function getRecord(store, key, errorMessage) {
+  return await new Promise((resolve, reject) => {
+    const req = store.get(key);
+    req.onsuccess = () => resolve(req.result || null);
+    req.onerror = () => reject(req.error || new Error(errorMessage || "读取记录失败"));
+  });
+}
+
+async function getAllRecords(store, errorMessage) {
+  return await new Promise((resolve, reject) => {
+    const req = store.getAll();
+    req.onsuccess = () => resolve(req.result || []);
+    req.onerror = () => reject(req.error || new Error(errorMessage || "读取列表失败"));
+  });
+}
+
+async function assertTeacherCanAccessSubmission(db, submission, teacherUser) {
+  if (teacherUser?.role !== "教师") {
+    throw new Error("仅教师可执行该操作");
+  }
+  if (!submission?.classId) return;
+
+  const tx = db.transaction([STORE_CLASSES], "readonly");
+  const klass = await getRecord(tx.objectStore(STORE_CLASSES), submission.classId, "读取班级失败");
+  await txDone(tx);
+  if (!hasTeacherClassAccess(klass, teacherUser.username)) {
+    throw new Error("无该班级权限，不能查看或批改该作业");
+  }
+}
+
 export async function ensureDefaults() {
   const db = await openDb();
-  const tx = db.transaction([STORE_USERS], "readwrite");
+  const tx = db.transaction([STORE_USERS, STORE_CLASSES], "readwrite");
   const users = tx.objectStore(STORE_USERS);
+  const classes = tx.objectStore(STORE_CLASSES);
 
-  const existing = await new Promise((resolve) => {
-    const req = users.get("teacher");
-    req.onsuccess = () => resolve(req.result);
-    req.onerror = () => resolve(null);
-  });
+  const existing = await getRecord(users, "teacher");
 
   if (!existing) {
     users.put({
@@ -239,6 +293,20 @@ export async function ensureDefaults() {
       password: "123456",
       displayName: "默认教师",
       role: "教师",
+      createdAt: nowIso(),
+    });
+  }
+
+  const defaultClass = await getRecord(classes, "default-class");
+  if (!defaultClass) {
+    classes.put({
+      id: "default-class",
+      name: "默认班级",
+      description: "系统内置演示班级",
+      ownerUsername: "teacher",
+      ownerName: "默认教师",
+      controllerUsernames: [],
+      memberUsernames: [],
       createdAt: nowIso(),
     });
   }
@@ -286,7 +354,7 @@ export async function registerUser({ username, password, displayName, role }) {
   store.put(user);
   await txDone(tx);
   db.close();
-  return { ...user, password: undefined };
+  return publicUser(user);
 }
 
 export async function loginUser({ username, password }) {
@@ -311,7 +379,7 @@ export async function loginUser({ username, password }) {
   if (!user || user.password !== p) {
     throw new Error("账号或密码错误");
   }
-  return { ...user, password: undefined };
+  return publicUser(user);
 }
 
 export async function getUser(username) {
@@ -331,7 +399,154 @@ export async function getUser(username) {
   db.close();
 
   if (!user) return null;
-  return { ...user, password: undefined };
+  return publicUser(user);
+}
+
+export async function listTeachers() {
+  const db = await openDb();
+  const tx = db.transaction([STORE_USERS], "readonly");
+  const users = await getAllRecords(tx.objectStore(STORE_USERS), "读取教师列表失败");
+  await txDone(tx);
+  db.close();
+  return users.filter((u) => u.role === "教师").map(publicUser).sort((a, b) => a.username.localeCompare(b.username));
+}
+
+export async function listClasses() {
+  const db = await openDb();
+  const tx = db.transaction([STORE_CLASSES], "readonly");
+  const classes = await getAllRecords(tx.objectStore(STORE_CLASSES), "读取班级列表失败");
+  await txDone(tx);
+  db.close();
+  classes.sort((a, b) => String(b.createdAt).localeCompare(String(a.createdAt)));
+  return classes;
+}
+
+export async function listClassesForStudent(studentUsername) {
+  const u = toSafeString(studentUsername);
+  const classes = await listClasses();
+  return classes.map((klass) => ({
+    ...klass,
+    joined: (klass.memberUsernames || []).includes(u),
+  }));
+}
+
+export async function listClassesForTeacher(teacherUsername) {
+  const u = toSafeString(teacherUsername);
+  const classes = await listClasses();
+  return classes.filter((klass) => hasTeacherClassAccess(klass, u));
+}
+
+export async function createClass({ teacherUser, name, description }) {
+  if (teacherUser?.role !== "教师") throw new Error("仅教师可以创建班级");
+  const className = toSafeString(name);
+  if (!className) throw new Error("请填写班级名称");
+
+  const klass = {
+    id: crypto.randomUUID(),
+    name: className,
+    description: toSafeString(description),
+    ownerUsername: teacherUser.username,
+    ownerName: teacherUser.displayName,
+    controllerUsernames: [],
+    memberUsernames: [],
+    createdAt: nowIso(),
+  };
+
+  const db = await openDb();
+  const tx = db.transaction([STORE_CLASSES], "readwrite");
+  tx.objectStore(STORE_CLASSES).put(klass);
+  await txDone(tx);
+  db.close();
+  return klass;
+}
+
+export async function joinClass({ studentUser, classId }) {
+  if (studentUser?.role !== "学生") throw new Error("仅学生可以加入班级");
+  const id = toSafeString(classId);
+  if (!id) throw new Error("请选择班级");
+
+  const db = await openDb();
+  const tx = db.transaction([STORE_CLASSES], "readwrite");
+  const store = tx.objectStore(STORE_CLASSES);
+  const klass = await getRecord(store, id, "读取班级失败");
+  if (!klass) {
+    tx.abort();
+    db.close();
+    throw new Error("班级不存在");
+  }
+  klass.memberUsernames = uniqueStrings([...(klass.memberUsernames || []), studentUser.username]);
+  store.put(klass);
+  await txDone(tx);
+  db.close();
+  return klass;
+}
+
+export async function grantClassTeacherAccess({ classId, ownerUser, teacherUsername }) {
+  if (ownerUser?.role !== "教师") throw new Error("仅教师可以授权");
+  const id = toSafeString(classId);
+  const target = toSafeString(teacherUsername);
+  if (!id || !target) throw new Error("请选择班级并填写教师账号");
+
+  const db = await openDb();
+  const tx = db.transaction([STORE_CLASSES, STORE_USERS], "readwrite");
+  const classes = tx.objectStore(STORE_CLASSES);
+  const users = tx.objectStore(STORE_USERS);
+  const klass = await getRecord(classes, id, "读取班级失败");
+  const teacher = await getRecord(users, target, "读取教师失败");
+
+  if (!klass) {
+    tx.abort();
+    db.close();
+    throw new Error("班级不存在");
+  }
+  if (klass.ownerUsername !== ownerUser.username) {
+    tx.abort();
+    db.close();
+    throw new Error("只有班级创建者可以开放控制权限");
+  }
+  if (!teacher || teacher.role !== "教师") {
+    tx.abort();
+    db.close();
+    throw new Error("指定账号不是教师");
+  }
+  if (target === klass.ownerUsername) {
+    tx.abort();
+    db.close();
+    throw new Error("创建者已拥有控制权限");
+  }
+
+  klass.controllerUsernames = uniqueStrings([...(klass.controllerUsernames || []), target]);
+  classes.put(klass);
+  await txDone(tx);
+  db.close();
+  return klass;
+}
+
+export async function revokeClassTeacherAccess({ classId, ownerUser, teacherUsername }) {
+  if (ownerUser?.role !== "教师") throw new Error("仅教师可以取消授权");
+  const id = toSafeString(classId);
+  const target = toSafeString(teacherUsername);
+  if (!id || !target) throw new Error("请选择班级和教师");
+
+  const db = await openDb();
+  const tx = db.transaction([STORE_CLASSES], "readwrite");
+  const store = tx.objectStore(STORE_CLASSES);
+  const klass = await getRecord(store, id, "读取班级失败");
+  if (!klass) {
+    tx.abort();
+    db.close();
+    throw new Error("班级不存在");
+  }
+  if (klass.ownerUsername !== ownerUser.username) {
+    tx.abort();
+    db.close();
+    throw new Error("只有班级创建者可以取消控制权限");
+  }
+  klass.controllerUsernames = (klass.controllerUsernames || []).filter((u) => u !== target);
+  store.put(klass);
+  await txDone(tx);
+  db.close();
+  return klass;
 }
 
 async function putFile(db, file) {
@@ -366,21 +581,42 @@ export async function getFileRecord(fileKey) {
   return record;
 }
 
-export async function submitAssignment({ studentUser, file }) {
+export async function submitAssignment({ studentUser, file, classId }) {
   if (!studentUser?.username) {
     throw new Error("未登录");
+  }
+  if (studentUser.role !== "学生") {
+    throw new Error("仅学生可以提交作业");
   }
   if (!(file instanceof File)) {
     throw new Error("请选择文件");
   }
+  const targetClassId = toSafeString(classId);
+  if (!targetClassId) {
+    throw new Error("请选择提交班级");
+  }
 
   const db = await openDb();
+  const classTx = db.transaction([STORE_CLASSES], "readonly");
+  const klass = await getRecord(classTx.objectStore(STORE_CLASSES), targetClassId, "读取班级失败");
+  await txDone(classTx);
+  if (!klass) {
+    db.close();
+    throw new Error("班级不存在");
+  }
+  if (!(klass.memberUsernames || []).includes(studentUser.username)) {
+    db.close();
+    throw new Error("请先加入该班级，再提交作业");
+  }
+
   const fileRecord = await putFile(db, file);
 
   const submission = {
     id: crypto.randomUUID(),
     studentUsername: studentUser.username,
     studentName: studentUser.displayName,
+    classId: klass.id,
+    className: klass.name,
     fileName: file.name,
     submitTime: nowIso(),
     status: AssignmentStatus.SUBMITTED.code,
@@ -499,6 +735,23 @@ export async function listAllSubmissions() {
   return submissions;
 }
 
+export async function listSubmissionsForTeacher(teacherUsername) {
+  const u = toSafeString(teacherUsername);
+  if (!u) return [];
+
+  const db = await openDb();
+  const tx = db.transaction([STORE_SUBMISSIONS, STORE_CLASSES], "readonly");
+  const submissions = await getAllRecords(tx.objectStore(STORE_SUBMISSIONS), "读取作业列表失败");
+  const classes = await getAllRecords(tx.objectStore(STORE_CLASSES), "读取班级列表失败");
+  await txDone(tx);
+  db.close();
+
+  const accessibleClassIds = new Set(classes.filter((klass) => hasTeacherClassAccess(klass, u)).map((klass) => klass.id));
+  const visible = submissions.filter((submission) => !submission.classId || accessibleClassIds.has(submission.classId));
+  visible.sort((a, b) => String(b.submitTime).localeCompare(String(a.submitTime)));
+  return visible;
+}
+
 export async function listSubmissionsForStudent(studentUsername) {
   const u = toSafeString(studentUsername);
   if (!u) return [];
@@ -568,7 +821,7 @@ export async function saveOriginalTextFile({ submissionId, text }) {
   return submission;
 }
 
-export async function saveOnlineReview({ submissionId, reviewContent, teacherNote }) {
+export async function saveOnlineReview({ submissionId, reviewContent, teacherNote, teacherUser }) {
   const id = toSafeString(submissionId);
   if (!id) throw new Error("参数错误");
 
@@ -587,6 +840,7 @@ export async function saveOnlineReview({ submissionId, reviewContent, teacherNot
     db.close();
     throw new Error("作业不存在");
   }
+  await assertTeacherCanAccessSubmission(db, submission, teacherUser);
 
   submission.onlineReviewContent = String(reviewContent ?? "");
   submission.teacherNote = toSafeString(teacherNote) || null;
@@ -609,7 +863,7 @@ export async function saveOnlineReview({ submissionId, reviewContent, teacherNot
   return submission;
 }
 
-export async function saveStudentCorrection({ submissionId, correctionContent }) {
+export async function saveStudentCorrection({ submissionId, correctionContent, studentUser }) {
   const id = toSafeString(submissionId);
   if (!id) throw new Error("参数错误");
 
@@ -627,6 +881,10 @@ export async function saveStudentCorrection({ submissionId, correctionContent })
   if (!submission) {
     db.close();
     throw new Error("作业不存在");
+  }
+  if (studentUser?.role !== "学生" || submission.studentUsername !== studentUser.username) {
+    db.close();
+    throw new Error("只能订正本人提交的作业");
   }
 
   submission.onlineReviewContent = String(correctionContent ?? "");
@@ -650,34 +908,31 @@ export async function saveStudentCorrection({ submissionId, correctionContent })
   return submission;
 }
 
-export async function uploadReviewFile({ submissionId, reviewFile, teacherNote }) {
+export async function uploadReviewFile({ submissionId, reviewFile, teacherNote, teacherUser }) {
   const id = toSafeString(submissionId);
   if (!id) throw new Error("参数错误");
   if (!(reviewFile instanceof File)) throw new Error("请选择批改文件");
 
   const db = await openDb();
-  const fileRecord = await putFile(db, reviewFile);
-
-  const tx = db.transaction([STORE_SUBMISSIONS], "readwrite");
-  const store = tx.objectStore(STORE_SUBMISSIONS);
-
-  const submission = await new Promise((resolve, reject) => {
-    const req = store.get(id);
-    req.onsuccess = () => resolve(req.result || null);
-    req.onerror = () => reject(req.error || new Error("读取作业失败"));
-  });
+  const loadTx = db.transaction([STORE_SUBMISSIONS], "readonly");
+  const submission = await getRecord(loadTx.objectStore(STORE_SUBMISSIONS), id, "读取作业失败");
+  await txDone(loadTx);
 
   if (!submission) {
-    tx.abort();
     db.close();
     throw new Error("作业不存在");
   }
+  await assertTeacherCanAccessSubmission(db, submission, teacherUser);
+
+  const fileRecord = await putFile(db, reviewFile);
 
   submission.reviewFileKey = fileRecord.key;
   submission.reviewFileName = reviewFile.name;
   submission.teacherNote = toSafeString(teacherNote) || null;
   submission.status = AssignmentStatus.REVIEWED.code;
 
+  const tx = db.transaction([STORE_SUBMISSIONS], "readwrite");
+  const store = tx.objectStore(STORE_SUBMISSIONS);
   store.put(submission);
   await txDone(tx);
   db.close();

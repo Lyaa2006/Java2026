@@ -1340,6 +1340,29 @@ async function openTextWorkspace({ submission, originalText, defaultTab }) {
     setCaretAtStart(roleSpan);
   }
 
+  function insertTextAtCaret(editor, text) {
+    ensureRoleSpanAtCaret(editor);
+    const sel = window.getSelection();
+    if (!sel || !sel.rangeCount) return;
+    let range = sel.getRangeAt(0);
+    if (!editor.contains(range.startContainer)) return;
+
+    if (!range.collapsed) {
+      range.deleteContents();
+      sel.removeAllRanges();
+      sel.addRange(range);
+      ensureRoleSpanAtCaret(editor);
+      range = sel.getRangeAt(0);
+    }
+
+    const textNode = document.createTextNode(String(text ?? ""));
+    range.insertNode(textNode);
+    range.setStartAfter(textNode);
+    range.collapse(true);
+    sel.removeAllRanges();
+    sel.addRange(range);
+  }
+
   function editorToRich(editor) {
     const runs = [];
     for (const node of Array.from(editor.childNodes)) {
@@ -1365,30 +1388,64 @@ async function openTextWorkspace({ submission, originalText, defaultTab }) {
   normalizeEditor(editor);
 
   if (editable) {
-    editor.addEventListener("compositionstart", () => ensureRoleSpanAtCaret(editor));
+    let isComposingText = false;
+    let normalizeTimer = 0;
+
+    function scheduleNormalizeEditor() {
+      if (normalizeTimer) window.clearTimeout(normalizeTimer);
+      normalizeTimer = window.setTimeout(() => {
+        normalizeTimer = 0;
+        if (!isComposingText) normalizeEditor(editor);
+      }, 0);
+    }
+
+    editor.addEventListener("compositionstart", () => {
+      isComposingText = true;
+      ensureRoleSpanAtCaret(editor);
+    });
+    editor.addEventListener("compositionend", () => {
+      isComposingText = false;
+      scheduleNormalizeEditor();
+    });
+    editor.addEventListener("keydown", (event) => {
+      if (event.key !== "Enter" || isComposingText || event.isComposing) return;
+      event.preventDefault();
+      insertTextAtCaret(editor, "\n");
+      normalizeEditor(editor);
+    });
     editor.addEventListener("beforeinput", (event) => {
       if (!editable) {
         event.preventDefault();
         return;
       }
-      if (event.inputType === "insertParagraph") {
+      const inputType = String(event.inputType || "");
+      if (inputType === "insertParagraph" || inputType === "insertLineBreak") {
+        if (isComposingText || event.isComposing) return;
         event.preventDefault();
-        ensureRoleSpanAtCaret(editor);
-        document.execCommand("insertText", false, "\n");
+        insertTextAtCaret(editor, "\n");
         normalizeEditor(editor);
         return;
       }
-      if (String(event.inputType || "").startsWith("insert")) {
+      if (isComposingText || event.isComposing || inputType === "insertCompositionText") {
+        return;
+      }
+      if (inputType.startsWith("insert")) {
         ensureRoleSpanAtCaret(editor);
       }
-      setTimeout(() => normalizeEditor(editor), 0);
+      scheduleNormalizeEditor();
+    });
+    editor.addEventListener("input", (event) => {
+      const inputType = String(event.inputType || "");
+      if (isComposingText || event.isComposing || inputType === "insertCompositionText") {
+        return;
+      }
+      scheduleNormalizeEditor();
     });
     editor.addEventListener("paste", (event) => {
       if (!event.clipboardData) return;
       event.preventDefault();
-      ensureRoleSpanAtCaret(editor);
       const text = event.clipboardData.getData("text/plain");
-      document.execCommand("insertText", false, text);
+      insertTextAtCaret(editor, text);
       normalizeEditor(editor);
     });
   }

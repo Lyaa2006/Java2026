@@ -245,7 +245,7 @@ function openModal({ title, body, footerButtons }) {
     "div",
     { class: "modal-header" },
     el("div", { class: "modal-title", text: title || "" }),
-    el("button", { class: "btn small", onClick: closeModal, type: "button" }, "关闭")
+    //el("button", { class: "btn small", onClick: closeModal, type: "button" }, "关闭")
   );
   const bodyWrap = el("div", { class: "modal-body" }, body);
   const footer = el("div", { class: "modal-footer" }, footerButtons || []);

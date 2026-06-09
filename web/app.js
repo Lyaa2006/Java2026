@@ -1205,12 +1205,47 @@ async function openTextWorkspace({ submission, originalText, defaultTab }) {
     return segments;
   }
 
+  function sourceMetaFor(src) {
+    if (src === "T") return { src: "T", className: "seg-teacher", color: "#d00000" };
+    if (src === "S") return { src: "S", className: "seg-student", color: "#0058dc" };
+    return { src: "O", className: "seg-original", color: "#000000" };
+  }
+
   function spanForSegment(seg) {
+    const meta = sourceMetaFor(seg.src);
     const span = document.createElement("span");
-    span.dataset.src = seg.src;
-    span.className = seg.src === "T" ? "seg-teacher" : seg.src === "S" ? "seg-student" : "seg-original";
+    span.dataset.src = meta.src;
+    span.className = meta.className;
+    span.style.color = meta.color;
     span.textContent = seg.text || "";
     return span;
+  }
+
+  function collectSegmentsFromNode(node, inheritedSrc = "O") {
+    if (!node) return [];
+    if (node.nodeType === 3) {
+      return node.nodeValue ? [{ src: inheritedSrc, text: node.nodeValue }] : [];
+    }
+    if (node.nodeType !== 1) return [];
+    if (node.tagName === "BR") return [{ src: inheritedSrc, text: "\n" }];
+
+    const currentSrc = node.tagName === "SPAN" ? node.dataset?.src || inheritedSrc || "O" : inheritedSrc;
+    const segments = [];
+    for (const child of Array.from(node.childNodes)) {
+      segments.push(...collectSegmentsFromNode(child, currentSrc));
+    }
+    if (!segments.length && node.tagName === "SPAN") {
+      segments.push({ src: currentSrc, text: "" });
+    }
+    return segments;
+  }
+
+  function collectSegmentsFromEditor(editor) {
+    const segments = [];
+    for (const child of Array.from(editor.childNodes)) {
+      segments.push(...collectSegmentsFromNode(child, "O"));
+    }
+    return segments;
   }
 
   function getCaretOffset(editor) {
@@ -1248,28 +1283,16 @@ async function openTextWorkspace({ submission, originalText, defaultTab }) {
 
   function normalizeEditor(editor) {
     const caretOffset = getCaretOffset(editor);
-    const children = Array.from(editor.childNodes);
-    const spans = [];
-    for (const node of children) {
-      if (node.nodeType === 3) {
-        const text = node.nodeValue || "";
-        const span = spanForSegment({ src: "O", text });
-        spans.push(span);
-      } else if (node.nodeType === 1 && node.tagName === "SPAN") {
-        const src = node.dataset?.src || "O";
-        spans.push(spanForSegment({ src, text: node.textContent || "" }));
-      }
-    }
-
+    const segments = collectSegmentsFromEditor(editor);
     const merged = [];
-    for (const s of spans) {
-      if (!s.textContent) continue;
+    for (const segment of segments) {
+      if (!segment.text) continue;
       const prev = merged[merged.length - 1];
-      if (prev && prev.dataset.src === s.dataset.src) prev.textContent += s.textContent;
-      else merged.push(s);
+      if (prev && prev.src === segment.src) prev.text += segment.text;
+      else merged.push({ src: segment.src, text: segment.text });
     }
 
-    editor.replaceChildren(...(merged.length ? merged : [spanForSegment({ src: "O", text: "" })]));
+    editor.replaceChildren(...(merged.length ? merged.map(spanForSegment) : [spanForSegment({ src: "O", text: "" })]));
     restoreCaretOffset(editor, caretOffset);
   }
 
@@ -1365,10 +1388,9 @@ async function openTextWorkspace({ submission, originalText, defaultTab }) {
 
   function editorToRich(editor) {
     const runs = [];
-    for (const node of Array.from(editor.childNodes)) {
-      if (node.nodeType !== 1 || node.tagName !== "SPAN") continue;
-      const src = node.dataset?.src || "O";
-      const text = node.textContent || "";
+    for (const segment of collectSegmentsFromEditor(editor)) {
+      const src = segment.src || "O";
+      const text = segment.text || "";
       if (!text) continue;
       const prev = runs[runs.length - 1];
       if (prev && prev.src === src) prev.text += text;
@@ -1419,6 +1441,13 @@ async function openTextWorkspace({ submission, originalText, defaultTab }) {
         return;
       }
       const inputType = String(event.inputType || "");
+      if (inputType === "insertText" || inputType === "insertFromComposition") {
+        if (isComposingText || event.isComposing) return;
+        event.preventDefault();
+        insertTextAtCaret(editor, event.data || "");
+        normalizeEditor(editor);
+        return;
+      }
       if (inputType === "insertParagraph" || inputType === "insertLineBreak") {
         if (isComposingText || event.isComposing) return;
         event.preventDefault();

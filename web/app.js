@@ -890,15 +890,6 @@ function buildSubmissionTable(submissions, { role }) {
         el(
           "button",
           {
-            class: "btn small",
-            type: "button",
-            onClick: () => onStudentViewOnlineReview(s),
-          },
-          "在线查看批改"
-        ),
-        el(
-          "button",
-          {
             class: "btn small primary",
             type: "button",
             onClick: () => onStudentOnlineCorrection(s),

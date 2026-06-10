@@ -336,6 +336,12 @@ function renderLogin() {
   function buildLoginForm() {
     const username = el("input", { autocomplete: "username", placeholder: "例如：teacher" });
     const password = el("input", { autocomplete: "current-password", type: "password", placeholder: "例如：123456" });
+    const role = el(
+      "select",
+      null,
+      el("option", { value: "学生", text: "学生" }),
+      el("option", { value: "教师", text: "教师" })
+    );
     const msg = el("div");
 
     const form = el(
@@ -345,7 +351,7 @@ function renderLogin() {
           event.preventDefault();
           clear(msg);
           try {
-            const user = await loginUser({ username: username.value, password: password.value });
+            const user = await loginUser({ username: username.value, password: password.value, role: role.value });
             currentUser = user;
             setSessionUser(user.username);
             render();
@@ -356,23 +362,8 @@ function renderLogin() {
       },
       el("div", { class: "form-row" }, el("label", { text: "用户名" }), username),
       el("div", { class: "form-row" }, el("label", { text: "密码" }), password),
-      el(
-        "div",
-        { class: "form-row row" },
-        el("button", { class: "btn primary", type: "submit" }, "登录"),
-        el(
-          "button",
-          {
-            class: "btn",
-            type: "button",
-            onClick: () => {
-              username.value = "teacher";
-              password.value = "123456";
-            },
-          },
-          "填入默认教师"
-        )
-      ),
+      el("div", { class: "form-row" }, el("label", { text: "角色" }), role),
+      el("div", { class: "form-row row" }, el("button", { class: "btn primary", type: "submit" }, "登录")),
       msg,
       el("div", { class: "hint" }, "提示：本版本所有数据都存储在浏览器本地，同一台设备/同一浏览器内可体验完整流程。")
     );
@@ -840,15 +831,6 @@ function buildSubmissionTable(submissions, { role }) {
             onClick: () => onDownloadReviewFile(s),
           },
           "下载批改文件"
-        ),
-        el(
-          "button",
-          {
-            class: "btn small",
-            type: "button",
-            onClick: () => onDownloadRevisedFile(s),
-          },
-          "下载订正文件"
         ),
         el(
           "button",

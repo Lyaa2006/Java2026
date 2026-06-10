@@ -357,11 +357,15 @@ export async function registerUser({ username, password, displayName, role }) {
   return publicUser(user);
 }
 
-export async function loginUser({ username, password }) {
+export async function loginUser({ username, password, role }) {
   const u = toSafeString(username);
   const p = toSafeString(password);
-  if (!u || !p) {
-    throw new Error("请输入用户名和密码");
+  const r = toSafeString(role);
+  if (!u || !p || !r) {
+    throw new Error("请输入用户名、密码和角色");
+  }
+  if (r !== "学生" && r !== "教师") {
+    throw new Error("角色不合法");
   }
 
   const db = await openDb();
@@ -378,6 +382,9 @@ export async function loginUser({ username, password }) {
 
   if (!user || user.password !== p) {
     throw new Error("账号或密码错误");
+  }
+  if (user.role !== r) {
+    throw new Error(r === "教师" ? "该账号不是教师账号" : "该账号不是学生账号");
   }
   return publicUser(user);
 }

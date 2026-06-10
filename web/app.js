@@ -7,7 +7,6 @@ import {
   getUser,
   grantClassTeacherAccess,
   isTextFileName,
-  joinClass,
   listClassesForStudent,
   listClassesForTeacher,
   listSubmissionsForTeacher,
@@ -16,6 +15,8 @@ import {
   loadSubmissionOriginalText,
   loginUser,
   registerUser,
+  requestClassJoin,
+  reviewClassJoinRequest,
   revokeClassTeacherAccess,
   saveOnlineReview,
   saveStudentCorrection,
@@ -544,6 +545,7 @@ async function openJoinClassModal({ afterJoin }) {
     }
     for (const klass of classes) {
       const joined = !!klass.joined;
+      const pending = !!klass.pending;
       body.append(
         el(
           "div",
@@ -560,12 +562,12 @@ async function openJoinClassModal({ afterJoin }) {
             {
               class: `btn small ${joined ? "" : "primary"}`,
               type: "button",
-              disabled: joined,
+              disabled: joined || pending,
               onClick: async () => {
                 clear(msg);
                 try {
-                  await joinClass({ studentUser: currentUser, classId: klass.id });
-                  msg.append(showNotice({ type: "ok", text: "加入成功" }));
+                  await requestClassJoin({ studentUser: currentUser, classId: klass.id });
+                  msg.append(showNotice({ type: "ok", text: "申请已提交，请等待教师审批" }));
                   if (afterJoin) await afterJoin();
                   await redraw();
                 } catch (err) {
@@ -573,7 +575,7 @@ async function openJoinClassModal({ afterJoin }) {
                 }
               },
             },
-            joined ? "已加入" : "加入"
+            joined ? "已加入" : pending ? "待审批" : "申请加入"
           )
         )
       );
@@ -637,6 +639,7 @@ function buildTeacherClassManager({ classes, teachers, onChanged }) {
     for (const klass of classes) {
       const isOwner = klass.ownerUsername === currentUser.username;
       const authorized = klass.controllerUsernames || [];
+      const pendingStudents = klass.pendingUsernames || [];
       const teacherSelect = el("select", null, el("option", { value: "", text: "选择教师授权" }));
       for (const teacher of teachers) {
         if (teacher.username === klass.ownerUsername || authorized.includes(teacher.username)) continue;
@@ -684,7 +687,59 @@ function buildTeacherClassManager({ classes, teachers, onChanged }) {
             el("div", { style: "font-weight:700" }, klass.name),
             el("div", { class: "muted" }, `创建教师：${klass.ownerName || klass.ownerUsername}；学生数：${(klass.memberUsernames || []).length}`),
             klass.description ? el("div", { class: "hint", text: klass.description }) : null,
-            el("div", { class: "row", style: "margin-top:8px" }, el("span", { class: "muted", text: "控制权限：" }), authList)
+            el("div", { class: "row", style: "margin-top:8px" }, el("span", { class: "muted", text: "控制权限：" }), authList),
+            el(
+              "div",
+              { class: "join-requests" },
+              el("div", { class: "muted", text: `待审批申请：${pendingStudents.length}` }),
+              pendingStudents.map((username) =>
+                el(
+                  "div",
+                  { class: "join-request-row" },
+                  el("span", { text: username }),
+                  el(
+                    "div",
+                    { class: "row" },
+                    el(
+                      "button",
+                      {
+                        class: "btn small primary",
+                        type: "button",
+                        onClick: async () => {
+                          clear(msg);
+                          try {
+                            await reviewClassJoinRequest({ classId: klass.id, teacherUser: currentUser, studentUsername: username, approved: true });
+                            msg.append(showNotice({ type: "ok", text: `已同意 ${username} 加入班级` }));
+                            if (onChanged) await onChanged();
+                          } catch (err) {
+                            msg.append(showNotice({ type: "bad", text: err?.message || "审批失败" }));
+                          }
+                        },
+                      },
+                      "同意"
+                    ),
+                    el(
+                      "button",
+                      {
+                        class: "btn small danger",
+                        type: "button",
+                        onClick: async () => {
+                          clear(msg);
+                          try {
+                            await reviewClassJoinRequest({ classId: klass.id, teacherUser: currentUser, studentUsername: username, approved: false });
+                            msg.append(showNotice({ type: "ok", text: `已拒绝 ${username} 的申请` }));
+                            if (onChanged) await onChanged();
+                          } catch (err) {
+                            msg.append(showNotice({ type: "bad", text: err?.message || "审批失败" }));
+                          }
+                        },
+                      },
+                      "拒绝"
+                    )
+                  )
+                )
+              )
+            )
           ),
           isOwner
             ? el(
@@ -900,6 +955,13 @@ async function onDownloadOriginal(submission) {
 }
 
 async function onDownloadReviewFile(submission) {
+  if (submission.reviewFileKey) {
+    const uploadedFile = await getFileRecord(submission.reviewFileKey);
+    if (uploadedFile?.blob) {
+      downloadBlob({ blob: uploadedFile.blob, fileName: uploadedFile.name, contentType: uploadedFile.type });
+      return;
+    }
+  }
   if (isTextFileName(submission.fileName) && submission.onlineReviewContent) {
     const plain = exportPlainTextFromRich(submission.onlineReviewContent);
     downloadBlob({ blob: new Blob([plain], { type: "text/plain;charset=utf-8" }), fileName: submission.fileName });
@@ -926,6 +988,13 @@ async function onDownloadReviewFile(submission) {
 }
 
 async function onDownloadRevisedFile(submission) {
+  if (submission.revisedFileKey) {
+    const revisedFile = await getFileRecord(submission.revisedFileKey);
+    if (revisedFile?.blob) {
+      downloadBlob({ blob: revisedFile.blob, fileName: revisedFile.name, contentType: revisedFile.type });
+      return;
+    }
+  }
   if (isTextFileName(submission.fileName) && submission.onlineReviewContent) {
     const plain = exportPlainTextFromRich(submission.onlineReviewContent);
     downloadBlob({ blob: new Blob([plain], { type: "text/plain;charset=utf-8" }), fileName: submission.fileName });
@@ -1198,6 +1267,11 @@ async function openTextWorkspace({ submission, originalText, defaultTab }) {
     const span = document.createElement("span");
     span.dataset.src = meta.src;
     span.className = meta.className;
+    const protectedSegment = (roleSrc === "T" && meta.src === "S") || (roleSrc === "S" && meta.src === "T");
+    if (protectedSegment) {
+      span.classList.add("seg-protected");
+      span.title = "该内容由对方角色添加，不可修改";
+    }
     span.style.color = meta.color;
     span.textContent = seg.text || "";
     return span;
@@ -1345,6 +1419,40 @@ async function openTextWorkspace({ submission, originalText, defaultTab }) {
     setCaretAtStart(roleSpan);
   }
 
+  function inputTouchesProtectedContent(editor, inputType) {
+    const selection = window.getSelection();
+    if (!selection || !selection.rangeCount) return false;
+    const range = selection.getRangeAt(0);
+    if (!editor.contains(range.startContainer) || !editor.contains(range.endContainer)) return false;
+
+    const prefix = range.cloneRange();
+    prefix.selectNodeContents(editor);
+    prefix.setEnd(range.startContainer, range.startOffset);
+    const start = prefix.toString().length;
+    const selectedLength = range.toString().length;
+    const end = start + selectedLength;
+    const protectedSrc = roleSrc === "T" ? "S" : "T";
+    let offset = 0;
+
+    for (const segment of collectSegmentsFromEditor(editor)) {
+      const segmentEnd = offset + segment.text.length;
+      if (segment.src === protectedSrc) {
+        if (start !== end && start < segmentEnd && end > offset) return true;
+        if (start === end && inputType.includes("Backward") && start - 1 >= offset && start - 1 < segmentEnd) return true;
+        if (start === end && inputType.includes("Forward") && start >= offset && start < segmentEnd) return true;
+      }
+      offset = segmentEnd;
+    }
+    return false;
+  }
+
+  function rejectProtectedEdit(event, inputType) {
+    if (!inputTouchesProtectedContent(editor, inputType)) return false;
+    event.preventDefault();
+    statusBar.textContent = role === "教师" ? "学生的蓝色订正内容不可修改" : "教师的红色批注不可修改";
+    return true;
+  }
+
   function insertTextAtCaret(editor, text) {
     ensureRoleSpanAtCaret(editor);
     const sel = window.getSelection();
@@ -1413,6 +1521,7 @@ async function openTextWorkspace({ submission, originalText, defaultTab }) {
     });
     editor.addEventListener("keydown", (event) => {
       if (event.key !== "Enter" || isComposingText || event.isComposing) return;
+      if (rejectProtectedEdit(event, "insertLineBreak")) return;
       event.preventDefault();
       insertTextAtCaret(editor, "\n");
       normalizeEditor(editor);
@@ -1423,6 +1532,7 @@ async function openTextWorkspace({ submission, originalText, defaultTab }) {
         return;
       }
       const inputType = String(event.inputType || "");
+      if (rejectProtectedEdit(event, inputType)) return;
       if (inputType === "insertText" || inputType === "insertFromComposition") {
         if (isComposingText || event.isComposing) return;
         event.preventDefault();
@@ -1454,11 +1564,13 @@ async function openTextWorkspace({ submission, originalText, defaultTab }) {
     });
     editor.addEventListener("paste", (event) => {
       if (!event.clipboardData) return;
+      if (rejectProtectedEdit(event, "insertFromPaste")) return;
       event.preventDefault();
       const text = event.clipboardData.getData("text/plain");
       insertTextAtCaret(editor, text);
       normalizeEditor(editor);
     });
+    editor.addEventListener("cut", (event) => rejectProtectedEdit(event, "deleteByCut"));
   }
 
   const noteArea = el("textarea");

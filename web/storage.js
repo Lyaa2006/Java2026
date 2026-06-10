@@ -41,6 +41,33 @@ function isRichContent(content) {
   return typeof content === "string" && content.startsWith(RICH_MAGIC);
 }
 
+function parseRichRuns(content) {
+  if (!isRichContent(content)) return [{ src: "O", text: String(content ?? "") }];
+  const runs = [];
+  for (const line of String(content).split("\n").slice(1)) {
+    if (!line) continue;
+    const separator = line.indexOf(":");
+    if (separator <= 0) continue;
+    const src = line.slice(0, separator, 1) || "O";
+    const payload = line.slice(separator + 1);
+    runs.push({ src, text: payload ? decodeBase64ToUtf8(payload) : "" });
+  }
+  return runs;
+}
+
+function textForSource(content, source) {
+  return parseRichRuns(content)
+    .filter((run) => run.src === source)
+    .map((run) => run.text)
+    .join("");
+}
+
+function assertProtectedSourceUnchanged(previousContent, nextContent, protectedSource, message) {
+  if (textForSource(previousContent, protectedSource) !== textForSource(nextContent, protectedSource)) {
+    throw new Error(message);
+  }
+}
+
 export function exportPlainTextFromRich(content) {
   if (!isRichContent(content)) return String(content ?? "");
   const lines = String(content).split("\n");
@@ -307,6 +334,7 @@ export async function ensureDefaults() {
       ownerName: "默认教师",
       controllerUsernames: [],
       memberUsernames: [],
+      pendingUsernames: [],
       createdAt: nowIso(),
     });
   }
@@ -434,6 +462,7 @@ export async function listClassesForStudent(studentUsername) {
   return classes.map((klass) => ({
     ...klass,
     joined: (klass.memberUsernames || []).includes(u),
+    pending: (klass.pendingUsernames || []).includes(u),
   }));
 }
 
@@ -456,6 +485,7 @@ export async function createClass({ teacherUser, name, description }) {
     ownerName: teacherUser.displayName,
     controllerUsernames: [],
     memberUsernames: [],
+    pendingUsernames: [],
     createdAt: nowIso(),
   };
 
@@ -467,7 +497,7 @@ export async function createClass({ teacherUser, name, description }) {
   return klass;
 }
 
-export async function joinClass({ studentUser, classId }) {
+export async function requestClassJoin({ studentUser, classId }) {
   if (studentUser?.role !== "学生") throw new Error("仅学生可以加入班级");
   const id = toSafeString(classId);
   if (!id) throw new Error("请选择班级");
@@ -481,8 +511,62 @@ export async function joinClass({ studentUser, classId }) {
     db.close();
     throw new Error("班级不存在");
   }
-  klass.memberUsernames = uniqueStrings([...(klass.memberUsernames || []), studentUser.username]);
+  if ((klass.memberUsernames || []).includes(studentUser.username)) {
+    tx.abort();
+    db.close();
+    throw new Error("你已经是该班级成员");
+  }
+  if ((klass.pendingUsernames || []).includes(studentUser.username)) {
+    tx.abort();
+    db.close();
+    throw new Error("入班申请正在等待教师审批");
+  }
+  klass.pendingUsernames = uniqueStrings([...(klass.pendingUsernames || []), studentUser.username]);
   store.put(klass);
+  await txDone(tx);
+  db.close();
+  return klass;
+}
+
+export async function reviewClassJoinRequest({ classId, teacherUser, studentUsername, approved }) {
+  if (teacherUser?.role !== "教师") throw new Error("仅教师可以审批入班申请");
+  const id = toSafeString(classId);
+  const student = toSafeString(studentUsername);
+  if (!id || !student) throw new Error("审批参数不完整");
+
+  const db = await openDb();
+  const tx = db.transaction([STORE_CLASSES, STORE_USERS], "readwrite");
+  const classes = tx.objectStore(STORE_CLASSES);
+  const users = tx.objectStore(STORE_USERS);
+  const klass = await getRecord(classes, id, "读取班级失败");
+  const studentUser = await getRecord(users, student, "读取学生失败");
+
+  if (!klass) {
+    tx.abort();
+    db.close();
+    throw new Error("班级不存在");
+  }
+  if (!hasTeacherClassAccess(klass, teacherUser.username)) {
+    tx.abort();
+    db.close();
+    throw new Error("无该班级审批权限");
+  }
+  if (!studentUser || studentUser.role !== "学生") {
+    tx.abort();
+    db.close();
+    throw new Error("申请账号不是学生");
+  }
+  if (!(klass.pendingUsernames || []).includes(student)) {
+    tx.abort();
+    db.close();
+    throw new Error("该申请不存在或已处理");
+  }
+
+  klass.pendingUsernames = (klass.pendingUsernames || []).filter((username) => username !== student);
+  if (approved) {
+    klass.memberUsernames = uniqueStrings([...(klass.memberUsernames || []), student]);
+  }
+  classes.put(klass);
   await txDone(tx);
   db.close();
   return klass;
@@ -849,7 +933,9 @@ export async function saveOnlineReview({ submissionId, reviewContent, teacherNot
   }
   await assertTeacherCanAccessSubmission(db, submission, teacherUser);
 
-  submission.onlineReviewContent = String(reviewContent ?? "");
+  const nextReviewContent = String(reviewContent ?? "");
+  assertProtectedSourceUnchanged(submission.onlineReviewContent, nextReviewContent, "S", "教师不能修改学生的蓝色订正内容");
+  submission.onlineReviewContent = nextReviewContent;
   submission.teacherNote = toSafeString(teacherNote) || null;
   submission.status = AssignmentStatus.REVIEWED.code;
 
@@ -859,8 +945,6 @@ export async function saveOnlineReview({ submissionId, reviewContent, teacherNot
     const fileRecord = await putTextFile(db, { name: editedName, text: plain });
     submission.reviewFileKey = fileRecord.key;
     submission.reviewFileName = editedName;
-    submission.revisedFileKey = fileRecord.key;
-    submission.revisedFileName = editedName;
   }
 
   const saveTx = db.transaction([STORE_SUBMISSIONS], "readwrite");
@@ -894,7 +978,9 @@ export async function saveStudentCorrection({ submissionId, correctionContent, s
     throw new Error("只能订正本人提交的作业");
   }
 
-  submission.onlineReviewContent = String(correctionContent ?? "");
+  const nextCorrectionContent = String(correctionContent ?? "");
+  assertProtectedSourceUnchanged(submission.onlineReviewContent, nextCorrectionContent, "T", "学生不能修改教师的红色批注内容");
+  submission.onlineReviewContent = nextCorrectionContent;
   submission.onlineStudentFixContent = "";
   submission.status = AssignmentStatus.REVISED.code;
 
@@ -904,8 +990,6 @@ export async function saveStudentCorrection({ submissionId, correctionContent, s
     const fileRecord = await putTextFile(db, { name: editedName, text: plain });
     submission.revisedFileKey = fileRecord.key;
     submission.revisedFileName = editedName;
-    submission.reviewFileKey = fileRecord.key;
-    submission.reviewFileName = editedName;
   }
 
   const saveTx = db.transaction([STORE_SUBMISSIONS], "readwrite");

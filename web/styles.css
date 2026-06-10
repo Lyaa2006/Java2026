@@ -350,6 +350,24 @@ td {
   min-width: 260px;
 }
 
+.join-requests {
+  display: grid;
+  gap: 8px;
+  margin-top: 10px;
+}
+
+.join-request-row {
+  display: flex;
+  flex-wrap: wrap;
+  align-items: center;
+  justify-content: space-between;
+  gap: 10px;
+  padding: 8px 10px;
+  border: 1px solid rgba(255, 255, 255, 0.08);
+  border-radius: 8px;
+  background: rgba(255, 255, 255, 0.03);
+}
+
 .inline-x {
   border: none;
   background: transparent;
@@ -513,4 +531,9 @@ td {
 
 .seg-student {
   color: #0058dc;
+}
+
+.seg-protected {
+  background: rgba(255, 200, 90, 0.12);
+  border-radius: 2px;
 }

@@ -1,11 +1,13 @@
 import {
   createClass,
   createAssignment,
+  deleteSubmissionFile,
   ensureDefaults,
   ensureOnlineEditableContent,
   exportPlainTextFromRich,
   getFileRecord,
   getAssignment,
+  getSubmissionFiles,
   getUser,
   grantClassTeacherAccess,
   isTextFileName,
@@ -17,13 +19,13 @@ import {
   listSubmissionsForAssignment,
   listSubmissionsForStudent,
   listTeachers,
-  loadSubmissionOriginalText,
   loginUser,
   registerUser,
   requestClassJoin,
   reviewClassJoinRequest,
   revokeClassTeacherAccess,
   saveOnlineReview,
+  saveSubmissionTeacherNote,
   saveStudentCorrection,
   statusLabel,
   submitAssignmentToAssignment,
@@ -246,6 +248,7 @@ function closeModal() {
 }
 
 function openModal({ title, body, footerButtons }) {
+  if (modal.open) modal.close();
   clear(modal);
   const header = el(
     "div",
@@ -481,7 +484,7 @@ function buildAssignmentCard(assignment, actions = []) {
 }
 
 async function openStudentSubmitModal(assignment, afterSubmit) {
-  const fileInput = el("input", { type: "file", accept: ".pdf,.doc,.docx,.zip,.java,.txt,.md,.csv" });
+  const fileInput = el("input", { type: "file", accept: ".pdf,.doc,.docx,.zip,.java,.txt,.md,.csv", multiple: true });
   const msg = el("div");
 
   openModal({
@@ -491,7 +494,7 @@ async function openStudentSubmitModal(assignment, afterSubmit) {
       null,
       el("div", { class: "form-row" }, el("label", { text: "所属班级" }), el("div", { class: "pill" }, assignment.className || "未分班")),
       assignment.description ? el("div", { class: "form-row" }, el("label", { text: "作业说明" }), el("div", { class: "notice" }, assignment.description)) : null,
-      el("div", { class: "form-row" }, el("label", { text: "选择提交文件" }), fileInput),
+      el("div", { class: "form-row" }, el("label", { text: "选择提交文件（可多选）" }), fileInput),
       msg
     ),
     footerButtons: [
@@ -506,7 +509,7 @@ async function openStudentSubmitModal(assignment, afterSubmit) {
             try {
               await submitAssignmentToAssignment({
                 studentUser: currentUser,
-                file: fileInput.files?.[0],
+                files: fileInput.files,
                 assignmentId: assignment.id,
               });
               if (afterSubmit) await afterSubmit();
@@ -674,7 +677,12 @@ function renderStudentPanel() {
       el("div", { style: "font-weight:700; margin-bottom:10px" }, "我可以看到的作业"),
       assignmentWrap
     ),
-    null
+    el(
+      "div",
+      { class: "panel-section", style: "margin-top:12px" },
+      el("div", { style: "font-weight:700; margin-bottom:10px" }, "我的提交"),
+      tableWrap
+    )
   );
 }
 
@@ -1050,44 +1058,19 @@ function buildSubmissionTable(submissions, { role }) {
   const tbody = el("tbody");
   for (const s of submissions) {
     const actions = el("div", { class: "cell-actions" });
+    const files = getSubmissionFiles(s);
+    const fileText = files.length ? files.map((file, index) => `${index + 1}. ${file.fileName}`).join("\n") : "暂无文件";
 
     if (role === "教师") {
       actions.append(
         el(
           "button",
           {
-            class: "btn small",
-            type: "button",
-            onClick: () => onDownloadOriginal(s),
-          },
-          "下载作业"
-        ),
-        el(
-          "button",
-          {
-            class: "btn small",
-            type: "button",
-            onClick: () => onDownloadRevisedFile(s),
-          },
-          "下载订正文件"
-        ),
-        el(
-          "button",
-          {
-            class: "btn small",
-            type: "button",
-            onClick: () => onUploadReviewFile(s),
-          },
-          "上传批改文件"
-        ),
-        el(
-          "button",
-          {
             class: "btn small primary",
             type: "button",
-            onClick: () => onTeacherOnlineReview(s),
+            onClick: () => openSubmissionFilesModal(s, { role }),
           },
-          "在线查看/批改"
+          "打开提交"
         )
       );
     } else {
@@ -1095,20 +1078,11 @@ function buildSubmissionTable(submissions, { role }) {
         el(
           "button",
           {
-            class: "btn small",
-            type: "button",
-            onClick: () => onDownloadReviewFile(s),
-          },
-          "下载批改文件"
-        ),
-        el(
-          "button",
-          {
             class: "btn small primary",
             type: "button",
-            onClick: () => onStudentOnlineCorrection(s),
+            onClick: () => openSubmissionFilesModal(s, { role }),
           },
-          "在线订正"
+          "查看提交"
         ),
         el(
           "button",
@@ -1129,7 +1103,7 @@ function buildSubmissionTable(submissions, { role }) {
         el("td", { text: s.id.slice(0, 8) }),
         el("td", { text: `${s.studentName}（${s.studentUsername}）` }),
         el("td", { text: s.className || "未分班" }),
-        el("td", { text: s.fileName }),
+        el("td", { text: fileText }),
         el("td", null, el("span", { class: "status", text: statusLabel(s.status) })),
         el("td", { text: formatTime(s.submitTime) }),
         el("td", { text: s.teacherNote || "—" }),
@@ -1141,13 +1115,17 @@ function buildSubmissionTable(submissions, { role }) {
   return el("div", { class: "card" }, table);
 }
 
-async function onDownloadOriginal(submission) {
-  if (isTextFileName(submission.fileName) && submission.onlineReviewContent) {
-    const plain = exportPlainTextFromRich(submission.onlineReviewContent);
-    downloadBlob({ blob: new Blob([plain], { type: "text/plain;charset=utf-8" }), fileName: submission.fileName });
+function fileLabel(file, index = 0) {
+  return file?.fileName || `文件 ${index + 1}`;
+}
+
+async function onDownloadOriginal(submission, file) {
+  if (isTextFileName(file.fileName) && file.onlineReviewContent) {
+    const plain = exportPlainTextFromRich(file.onlineReviewContent);
+    downloadBlob({ blob: new Blob([plain], { type: "text/plain;charset=utf-8" }), fileName: file.fileName });
     return;
   }
-  const fileRecord = await getFileRecord(submission.originalFileKey);
+  const fileRecord = await getFileRecord(file.originalFileKey);
   if (!fileRecord?.blob) {
     openModal({
       title: "下载作业",
@@ -1159,20 +1137,20 @@ async function onDownloadOriginal(submission) {
   downloadBlob({ blob: fileRecord.blob, fileName: fileRecord.name, contentType: fileRecord.type });
 }
 
-async function onDownloadReviewFile(submission) {
-  if (submission.reviewFileKey) {
-    const uploadedFile = await getFileRecord(submission.reviewFileKey);
+async function onDownloadReviewFile(submission, file) {
+  if (file.reviewFileKey) {
+    const uploadedFile = await getFileRecord(file.reviewFileKey);
     if (uploadedFile?.blob) {
       downloadBlob({ blob: uploadedFile.blob, fileName: uploadedFile.name, contentType: uploadedFile.type });
       return;
     }
   }
-  if (isTextFileName(submission.fileName) && submission.onlineReviewContent) {
-    const plain = exportPlainTextFromRich(submission.onlineReviewContent);
-    downloadBlob({ blob: new Blob([plain], { type: "text/plain;charset=utf-8" }), fileName: submission.fileName });
+  if (isTextFileName(file.fileName) && file.onlineReviewContent) {
+    const plain = exportPlainTextFromRich(file.onlineReviewContent);
+    downloadBlob({ blob: new Blob([plain], { type: "text/plain;charset=utf-8" }), fileName: file.fileName });
     return;
   }
-  if (!submission.reviewFileKey) {
+  if (!file.reviewFileKey) {
     openModal({
       title: "下载批改文件",
       body: showNotice({ type: "warn", text: "暂无批改文件" }),
@@ -1180,7 +1158,7 @@ async function onDownloadReviewFile(submission) {
     });
     return;
   }
-  const fileRecord = await getFileRecord(submission.reviewFileKey);
+  const fileRecord = await getFileRecord(file.reviewFileKey);
   if (!fileRecord?.blob) {
     openModal({
       title: "下载批改文件",
@@ -1192,20 +1170,20 @@ async function onDownloadReviewFile(submission) {
   downloadBlob({ blob: fileRecord.blob, fileName: fileRecord.name, contentType: fileRecord.type });
 }
 
-async function onDownloadRevisedFile(submission) {
-  if (submission.revisedFileKey) {
-    const revisedFile = await getFileRecord(submission.revisedFileKey);
+async function onDownloadRevisedFile(submission, file) {
+  if (file.revisedFileKey) {
+    const revisedFile = await getFileRecord(file.revisedFileKey);
     if (revisedFile?.blob) {
       downloadBlob({ blob: revisedFile.blob, fileName: revisedFile.name, contentType: revisedFile.type });
       return;
     }
   }
-  if (isTextFileName(submission.fileName) && submission.onlineReviewContent) {
-    const plain = exportPlainTextFromRich(submission.onlineReviewContent);
-    downloadBlob({ blob: new Blob([plain], { type: "text/plain;charset=utf-8" }), fileName: submission.fileName });
+  if (isTextFileName(file.fileName) && file.onlineReviewContent) {
+    const plain = exportPlainTextFromRich(file.onlineReviewContent);
+    downloadBlob({ blob: new Blob([plain], { type: "text/plain;charset=utf-8" }), fileName: file.fileName });
     return;
   }
-  if (!submission.revisedFileKey) {
+  if (!file.revisedFileKey) {
     openModal({
       title: "下载订正文件",
       body: showNotice({ type: "warn", text: "暂无订正文件" }),
@@ -1213,7 +1191,7 @@ async function onDownloadRevisedFile(submission) {
     });
     return;
   }
-  const fileRecord = await getFileRecord(submission.revisedFileKey);
+  const fileRecord = await getFileRecord(file.revisedFileKey);
   if (!fileRecord?.blob) {
     openModal({
       title: "下载订正文件",
@@ -1225,7 +1203,25 @@ async function onDownloadRevisedFile(submission) {
   downloadBlob({ blob: fileRecord.blob, fileName: fileRecord.name, contentType: fileRecord.type });
 }
 
+async function onStudentDeleteSubmissionFile(submission, file) {
+  const confirmed = window.confirm(`确认删除文件“${fileLabel(file)}”吗？`);
+  if (!confirmed) return;
+
+  try {
+    await deleteSubmissionFile({ submissionId: submission.id, fileId: file.id, studentUser: currentUser });
+    closeModal();
+    render();
+  } catch (err) {
+    openModal({
+      title: "删除失败",
+      body: showNotice({ type: "bad", text: err?.message || "删除失败" }),
+      footerButtons: [el("button", { class: "btn", type: "button", onClick: closeModal }, "关闭")],
+    });
+  }
+}
+
 function onStudentDetail(submission) {
+  const files = getSubmissionFiles(submission);
   openModal({
     title: "作业详情",
     body: el(
@@ -1233,10 +1229,98 @@ function onStudentDetail(submission) {
       null,
       showNotice({
         type: "ok",
-        text: `状态：${statusLabel(submission.status)}\n教师批注：${submission.teacherNote || "暂无"}`,
+        text: `状态：${statusLabel(submission.status)}\n文件：${files.map((file, index) => `${index + 1}. ${file.fileName}`).join("\n") || "暂无文件"}\n教师批注：${submission.teacherNote || "暂无"}`,
       })
     ),
     footerButtons: [el("button", { class: "btn", type: "button", onClick: closeModal }, "关闭")],
+  });
+}
+
+function openSubmissionFilesModal(submission, { role }) {
+  const files = getSubmissionFiles(submission);
+  const msg = el("div");
+  const fileList = el("div", { class: "submission-file-list" });
+  const noteArea = el("textarea");
+  noteArea.value = submission.teacherNote || "";
+  noteArea.readOnly = role !== "教师";
+  noteArea.style.minHeight = "92px";
+
+  if (!files.length) {
+    fileList.append(showNotice({ type: "warn", text: "暂无文件" }));
+  }
+
+  files.forEach((file, index) => {
+    const actions = el("div", { class: "cell-actions" });
+    if (role === "教师") {
+      actions.append(
+        el("button", { class: "btn small", type: "button", onClick: () => onDownloadOriginal(submission, file) }, "下载作业"),
+        el("button", { class: "btn small", type: "button", onClick: () => onDownloadRevisedFile(submission, file) }, "下载订正文件"),
+        el("button", { class: "btn small", type: "button", onClick: () => onUploadReviewFile(submission, file) }, "上传批改文件"),
+        el("button", { class: "btn small primary", type: "button", onClick: () => onTeacherOnlineReview(submission, file) }, "在线查看/批改")
+      );
+    } else {
+      actions.append(
+        el("button", { class: "btn small", type: "button", onClick: () => onDownloadReviewFile(submission, file) }, "下载批改文件"),
+        el("button", { class: "btn small primary", type: "button", onClick: () => onStudentOnlineCorrection(submission, file) }, "在线订正"),
+        el("button", { class: "btn small danger", type: "button", onClick: () => onStudentDeleteSubmissionFile(submission, file) }, "删除文件")
+      );
+    }
+
+    fileList.append(
+      el(
+        "div",
+        { class: "submission-file-item" },
+        el(
+          "div",
+          null,
+          el("div", { style: "font-weight:700", text: `${index + 1}. ${fileLabel(file, index)}` }),
+          el(
+            "div",
+            { class: "muted" },
+            `${isTextFileName(file.fileName) ? "支持在线批改" : "仅支持文件下载/上传批改"} · ${file.reviewFileKey ? "已有批改文件" : "暂无批改文件"}`
+          )
+        ),
+        actions
+      )
+    );
+  });
+
+  const footerButtons = [el("button", { class: "btn", type: "button", onClick: closeModal }, "关闭")];
+  if (role === "教师") {
+    footerButtons.push(
+      el(
+        "button",
+        {
+          class: "btn primary",
+          type: "button",
+          onClick: async () => {
+            clear(msg);
+            try {
+              const updated = await saveSubmissionTeacherNote({ submissionId: submission.id, teacherNote: noteArea.value, teacherUser: currentUser });
+              submission.teacherNote = updated.teacherNote;
+              submission.status = updated.status;
+              msg.append(showNotice({ type: "ok", text: "总评已保存" }));
+            } catch (err) {
+              msg.append(showNotice({ type: "bad", text: err?.message || "保存失败" }));
+            }
+          },
+        },
+        "保存总评"
+      )
+    );
+  }
+
+  openModal({
+    title: `提交详情：${submission.studentName || submission.studentUsername}`,
+    body: el(
+      "div",
+      null,
+      el("div", { class: "form-row" }, el("label", { text: role === "教师" ? "提交总评" : "教师总评" }), noteArea),
+      msg,
+      el("div", { class: "hint" }, `共 ${files.length} 个文件`),
+      fileList
+    ),
+    footerButtons,
   });
 }
 
@@ -1421,19 +1505,21 @@ function createLineEditor({ submissionId, doc, initialText, readOnly, onSelectLi
   };
 }
 
-async function openTextWorkspace({ submission, originalText, defaultTab }) {
+async function openTextWorkspace({ submission, file }) {
+  if (modal.open) modal.close();
   const role = currentUser?.role || "";
   const canEditFile = role === "教师" || role === "学生";
   const canEditNote = role === "教师";
   const roleSrc = role === "教师" ? "T" : "S";
+  const docKey = `file:${file.id}`;
 
   const statusBar = el("div", { class: "hint" });
   const lockResult = canEditFile
-    ? collab.acquire({ submissionId: submission.id, doc: "file", line: 0, ownerLabel: `${currentUser.role}:${currentUser.username}` })
+    ? collab.acquire({ submissionId: submission.id, doc: docKey, line: 0, ownerLabel: `${currentUser.role}:${currentUser.username}` })
     : { ok: false, ownerLabel: "未登录" };
   const editable = !!lockResult.ok;
 
-  const { submission: latestSubmission, richContent } = await ensureOnlineEditableContent({ submissionId: submission.id });
+  const { submission: latestSubmission, richContent } = await ensureOnlineEditableContent({ submissionId: submission.id, fileId: file.id });
 
   function encodeUtf8ToBase64(text) {
     const bytes = new TextEncoder().encode(String(text ?? ""));
@@ -1822,9 +1908,9 @@ async function openTextWorkspace({ submission, originalText, defaultTab }) {
             try {
               const rich = editorToRich(editor);
               if (role === "教师") {
-                await saveOnlineReview({ submissionId: submission.id, reviewContent: rich, teacherNote: noteArea.value, teacherUser: currentUser });
+                await saveOnlineReview({ submissionId: submission.id, fileId: file.id, reviewContent: rich, teacherNote: noteArea.value, teacherUser: currentUser });
               } else {
-                await saveStudentCorrection({ submissionId: submission.id, correctionContent: rich, studentUser: currentUser });
+                await saveStudentCorrection({ submissionId: submission.id, fileId: file.id, correctionContent: rich, studentUser: currentUser });
               }
               closeModal();
               render();
@@ -1839,14 +1925,14 @@ async function openTextWorkspace({ submission, originalText, defaultTab }) {
   }
 
   openModal({
-    title: "在线查看/编辑",
+    title: `在线查看/编辑：${fileLabel(file)}`,
     body,
     footerButtons,
   });
 }
 
-async function onTeacherOnlineReview(submission) {
-  if (!isTextFileName(submission.fileName)) {
+async function onTeacherOnlineReview(submission, file) {
+  if (!isTextFileName(file.fileName)) {
     openModal({
       title: "在线批改",
       body: showNotice({ type: "warn", text: "当前文件类型不支持在线批改（仅支持 txt/java/md/csv）" }),
@@ -1855,11 +1941,11 @@ async function onTeacherOnlineReview(submission) {
     return;
   }
 
-  await openTextWorkspace({ submission });
+  await openTextWorkspace({ submission, file });
 }
 
-async function onStudentViewOnlineReview(submission) {
-  if (!isTextFileName(submission.fileName)) {
+async function onStudentViewOnlineReview(submission, file) {
+  if (!isTextFileName(file.fileName)) {
     openModal({
       title: "在线查看批改",
       body: showNotice({ type: "warn", text: "当前文件类型不支持在线查看（仅支持 txt/java/md/csv）" }),
@@ -1868,11 +1954,11 @@ async function onStudentViewOnlineReview(submission) {
     return;
   }
 
-  await openTextWorkspace({ submission });
+  await openTextWorkspace({ submission, file });
 }
 
-async function onStudentOnlineCorrection(submission) {
-  if (!isTextFileName(submission.fileName)) {
+async function onStudentOnlineCorrection(submission, file) {
+  if (!isTextFileName(file.fileName)) {
     openModal({
       title: "在线订正",
       body: showNotice({ type: "warn", text: "当前文件类型不支持在线订正（仅支持 txt/java/md/csv）" }),
@@ -1881,17 +1967,17 @@ async function onStudentOnlineCorrection(submission) {
     return;
   }
 
-  await openTextWorkspace({ submission });
+  await openTextWorkspace({ submission, file });
 }
 
-function onUploadReviewFile(submission) {
+function onUploadReviewFile(submission, file) {
   const reviewInput = el("input", { type: "file", accept: ".pdf,.doc,.docx,.zip,.txt,.md,.csv,.java" });
   const noteArea = el("textarea");
   noteArea.value = submission.teacherNote || "";
   noteArea.style.minHeight = "90px";
 
   openModal({
-    title: "上传批改文件",
+    title: `上传批改文件：${fileLabel(file)}`,
     body: el(
       "div",
       null,
@@ -1907,8 +1993,8 @@ function onUploadReviewFile(submission) {
           type: "button",
           onClick: async () => {
             try {
-              const file = reviewInput.files?.[0];
-              await uploadReviewFile({ submissionId: submission.id, reviewFile: file, teacherNote: noteArea.value, teacherUser: currentUser });
+              const reviewFile = reviewInput.files?.[0];
+              await uploadReviewFile({ submissionId: submission.id, fileId: file.id, reviewFile, teacherNote: noteArea.value, teacherUser: currentUser });
               closeModal();
               render();
             } catch (err) {

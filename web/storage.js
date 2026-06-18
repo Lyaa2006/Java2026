@@ -611,46 +611,112 @@ export async function getAssignment(assignmentId) {
   return assignment;
 }
 
-export async function submitAssignmentToAssignment({ studentUser, file, assignmentId }) {
+function normalizeFileList(files, fallbackFile) {
+  const list = Array.from(files || []);
+  if (!list.length && fallbackFile) list.push(fallbackFile);
+  return list.filter((item) => item instanceof File);
+}
+
+async function buildSubmissionFiles(db, files) {
+  const selectedFiles = normalizeFileList(files);
+  if (!selectedFiles.length) {
+    throw new Error("请选择至少一个文件");
+  }
+
+  const entries = [];
+  for (const file of selectedFiles) {
+    const fileRecord = await putFile(db, file);
+    entries.push({
+      id: crypto.randomUUID(),
+      fileName: file.name,
+      originalFileKey: fileRecord.key,
+      reviewFileName: null,
+      reviewFileKey: null,
+      revisedFileName: null,
+      revisedFileKey: null,
+      onlineReviewContent: null,
+      onlineStudentFixContent: null,
+      lineNotes: {},
+      uploadedAt: nowIso(),
+    });
+  }
+  return entries;
+}
+
+function mergeSubmissionFiles(existingFiles, incomingFiles) {
+  const merged = Array.isArray(existingFiles) ? [...existingFiles] : [];
+
+  for (const incoming of incomingFiles) {
+    const index = merged.findIndex((item) => item?.fileName === incoming.fileName);
+    if (index >= 0) {
+      merged[index] = incoming;
+    } else {
+      merged.push(incoming);
+    }
+  }
+
+  return merged;
+}
+
+export function getSubmissionFiles(submission) {
+  return Array.isArray(submission?.files) ? submission.files : [];
+}
+
+function getSubmissionFileEntry(submission, fileId) {
+  const id = toSafeString(fileId);
+  return getSubmissionFiles(submission).find((item) => item.id === id) || null;
+}
+
+function getSubmissionFileEntryOrThrow(submission, fileId) {
+  const file = getSubmissionFileEntry(submission, fileId);
+  if (!file) {
+    throw new Error("请选择提交中的文件");
+  }
+  return file;
+}
+
+async function findStudentAssignmentSubmission(store, assignmentId, studentUsername) {
+  const submissions = await getAllRecords(store, "读取作业提交列表失败");
+  return submissions.find((item) => item.assignmentId === assignmentId && item.studentUsername === studentUsername) || null;
+}
+
+export async function submitAssignmentToAssignment({ studentUser, file, files, assignmentId }) {
   if (!studentUser?.username) {
     throw new Error("未登录");
   }
   if (studentUser.role !== "学生") {
     throw new Error("仅学生可以提交作业");
   }
-  if (!(file instanceof File)) {
-    throw new Error("请选择文件");
+  const selectedFiles = normalizeFileList(files, file);
+  if (!selectedFiles.length) {
+    throw new Error("请选择至少一个文件");
   }
 
   const db = await openDb();
   const assignment = await getAssignmentOrThrow(db, assignmentId);
   const klass = await assertStudentCanAccessAssignment(db, assignment, studentUser);
-  const fileRecord = await putFile(db, file);
+  const submissionFiles = await buildSubmissionFiles(db, selectedFiles);
+
+  const tx = db.transaction([STORE_SUBMISSIONS], "readwrite");
+  const store = tx.objectStore(STORE_SUBMISSIONS);
+  const existing = await findStudentAssignmentSubmission(store, assignment.id, studentUser.username);
 
   const submission = {
-    id: crypto.randomUUID(),
+    ...(existing || {}),
+    id: existing?.id || crypto.randomUUID(),
     assignmentId: assignment.id,
     assignmentTitle: assignment.title,
     studentUsername: studentUser.username,
     studentName: studentUser.displayName,
     classId: klass.id,
     className: klass.name,
-    fileName: file.name,
+    files: mergeSubmissionFiles(existing?.files, submissionFiles),
     submitTime: nowIso(),
     status: AssignmentStatus.SUBMITTED.code,
     teacherNote: null,
-    reviewFileName: null,
-    originalFileKey: fileRecord.key,
-    reviewFileKey: null,
-    revisedFileName: null,
-    revisedFileKey: null,
-    onlineReviewContent: null,
-    onlineStudentFixContent: null,
-    lineNotes: {},
   };
 
-  const tx = db.transaction([STORE_SUBMISSIONS], "readwrite");
-  tx.objectStore(STORE_SUBMISSIONS).put(submission);
+  store.put(submission);
   await txDone(tx);
   db.close();
   return submission;
@@ -856,15 +922,16 @@ export async function getFileRecord(fileKey) {
   return record;
 }
 
-export async function submitAssignment({ studentUser, file, classId }) {
+export async function submitAssignment({ studentUser, file, files, classId }) {
   if (!studentUser?.username) {
     throw new Error("未登录");
   }
   if (studentUser.role !== "学生") {
     throw new Error("仅学生可以提交作业");
   }
-  if (!(file instanceof File)) {
-    throw new Error("请选择文件");
+  const selectedFiles = normalizeFileList(files, file);
+  if (!selectedFiles.length) {
+    throw new Error("请选择至少一个文件");
   }
   const targetClassId = toSafeString(classId);
   if (!targetClassId) {
@@ -884,7 +951,7 @@ export async function submitAssignment({ studentUser, file, classId }) {
     throw new Error("请先加入该班级，再提交作业");
   }
 
-  const fileRecord = await putFile(db, file);
+  const submissionFiles = await buildSubmissionFiles(db, selectedFiles);
 
   const submission = {
     id: crypto.randomUUID(),
@@ -892,18 +959,10 @@ export async function submitAssignment({ studentUser, file, classId }) {
     studentName: studentUser.displayName,
     classId: klass.id,
     className: klass.name,
-    fileName: file.name,
+    files: submissionFiles,
     submitTime: nowIso(),
     status: AssignmentStatus.SUBMITTED.code,
     teacherNote: null,
-    reviewFileName: null,
-    originalFileKey: fileRecord.key,
-    reviewFileKey: null,
-    revisedFileName: null,
-    revisedFileKey: null,
-    onlineReviewContent: null,
-    onlineStudentFixContent: null,
-    lineNotes: {},
   };
 
   const tx = db.transaction([STORE_SUBMISSIONS], "readwrite");
@@ -914,56 +973,11 @@ export async function submitAssignment({ studentUser, file, classId }) {
   return submission;
 }
 
-export async function updateSubmissionDraft({ submissionId, patch }) {
+export async function ensureOnlineEditableContent({ submissionId, fileId }) {
   const id = toSafeString(submissionId);
   if (!id) throw new Error("参数错误");
-  const p = patch && typeof patch === "object" ? patch : {};
-
-  const allowedKeys = new Set(["onlineReviewContent", "onlineStudentFixContent", "teacherNote", "lineNotes"]);
-  for (const key of Object.keys(p)) {
-    if (!allowedKeys.has(key)) {
-      throw new Error("不允许更新的字段: " + key);
-    }
-  }
-
-  const db = await openDb();
-  const tx = db.transaction([STORE_SUBMISSIONS], "readwrite");
-  const store = tx.objectStore(STORE_SUBMISSIONS);
-
-  const submission = await new Promise((resolve, reject) => {
-    const req = store.get(id);
-    req.onsuccess = () => resolve(req.result || null);
-    req.onerror = () => reject(req.error || new Error("读取作业失败"));
-  });
-
-  if (!submission) {
-    tx.abort();
-    db.close();
-    throw new Error("作业不存在");
-  }
-
-  if (Object.prototype.hasOwnProperty.call(p, "onlineReviewContent")) {
-    submission.onlineReviewContent = String(p.onlineReviewContent ?? "");
-  }
-  if (Object.prototype.hasOwnProperty.call(p, "onlineStudentFixContent")) {
-    submission.onlineStudentFixContent = String(p.onlineStudentFixContent ?? "");
-  }
-  if (Object.prototype.hasOwnProperty.call(p, "teacherNote")) {
-    submission.teacherNote = toSafeString(p.teacherNote) || null;
-  }
-  if (Object.prototype.hasOwnProperty.call(p, "lineNotes")) {
-    submission.lineNotes = p.lineNotes && typeof p.lineNotes === "object" ? p.lineNotes : {};
-  }
-
-  store.put(submission);
-  await txDone(tx);
-  db.close();
-  return submission;
-}
-
-export async function ensureOnlineEditableContent({ submissionId }) {
-  const id = toSafeString(submissionId);
-  if (!id) throw new Error("参数错误");
+  const targetFileId = toSafeString(fileId);
+  if (!targetFileId) throw new Error("请选择文件");
 
   const db = await openDb();
   const tx = db.transaction([STORE_SUBMISSIONS], "readonly");
@@ -977,20 +991,26 @@ export async function ensureOnlineEditableContent({ submissionId }) {
   db.close();
 
   if (!submission) throw new Error("作业不存在");
-  if (!isTextFileName(submission.fileName)) throw new Error("当前文件类型不支持在线编辑");
+  const file = getSubmissionFileEntryOrThrow(submission, targetFileId);
+  if (!isTextFileName(file.fileName)) throw new Error("当前文件类型不支持在线编辑");
 
-  const originalText = await loadSubmissionOriginalText(submission);
-  const current = submission.onlineReviewContent;
+  const originalText = await loadSubmissionOriginalText(submission, file.id);
+  const current = file.onlineReviewContent;
   if (isRichContent(current)) {
-    return { submission, originalText, richContent: current };
+    return { submission, file, originalText, richContent: current };
   }
 
-  const rich = migrateLegacyToRich(originalText, submission.onlineReviewContent, submission.onlineStudentFixContent);
-  const updated = await updateSubmissionDraft({
-    submissionId: submission.id,
-    patch: { onlineReviewContent: rich, onlineStudentFixContent: "", lineNotes: {} },
-  });
-  return { submission: updated, originalText, richContent: rich };
+  const rich = migrateLegacyToRich(originalText, file.onlineReviewContent, file.onlineStudentFixContent);
+  file.onlineReviewContent = rich;
+  file.onlineStudentFixContent = "";
+  file.lineNotes = {};
+
+  const saveDb = await openDb();
+  const saveTx = saveDb.transaction([STORE_SUBMISSIONS], "readwrite");
+  saveTx.objectStore(STORE_SUBMISSIONS).put(submission);
+  await txDone(saveTx);
+  saveDb.close();
+  return { submission, file, originalText, richContent: rich };
 }
 
 export async function listAllSubmissions() {
@@ -1113,9 +1133,11 @@ async function putTextFile(db, { name, text }) {
   return await putFile(db, fileLike);
 }
 
-export async function saveOriginalTextFile({ submissionId, text }) {
+export async function saveOriginalTextFile({ submissionId, fileId, text }) {
   const id = toSafeString(submissionId);
   if (!id) throw new Error("参数错误");
+  const targetFileId = toSafeString(fileId);
+  if (!targetFileId) throw new Error("请选择文件");
 
   const db = await openDb();
   const loadTx = db.transaction([STORE_SUBMISSIONS], "readonly");
@@ -1133,13 +1155,14 @@ export async function saveOriginalTextFile({ submissionId, text }) {
     throw new Error("作业不存在");
   }
 
-  if (!isTextFileName(submission.fileName)) {
+  const file = getSubmissionFileEntryOrThrow(submission, targetFileId);
+  if (!isTextFileName(file.fileName)) {
     db.close();
     throw new Error("当前文件类型不支持在线编辑");
   }
 
-  const fileRecord = await putTextFile(db, { name: submission.fileName, text });
-  submission.originalFileKey = fileRecord.key;
+  const fileRecord = await putTextFile(db, { name: file.fileName, text });
+  file.originalFileKey = fileRecord.key;
 
   const saveTx = db.transaction([STORE_SUBMISSIONS], "readwrite");
   saveTx.objectStore(STORE_SUBMISSIONS).put(submission);
@@ -1148,9 +1171,11 @@ export async function saveOriginalTextFile({ submissionId, text }) {
   return submission;
 }
 
-export async function saveOnlineReview({ submissionId, reviewContent, teacherNote, teacherUser }) {
+export async function saveOnlineReview({ submissionId, fileId, reviewContent, teacherNote, teacherUser }) {
   const id = toSafeString(submissionId);
   if (!id) throw new Error("参数错误");
+  const targetFileId = toSafeString(fileId);
+  if (!targetFileId) throw new Error("请选择文件");
 
   const db = await openDb();
   const loadTx = db.transaction([STORE_SUBMISSIONS], "readonly");
@@ -1168,19 +1193,20 @@ export async function saveOnlineReview({ submissionId, reviewContent, teacherNot
     throw new Error("作业不存在");
   }
   await assertTeacherCanAccessSubmission(db, submission, teacherUser);
+  const file = getSubmissionFileEntryOrThrow(submission, targetFileId);
 
   const nextReviewContent = String(reviewContent ?? "");
-  assertProtectedSourceUnchanged(submission.onlineReviewContent, nextReviewContent, "S", "教师不能修改学生的蓝色订正内容");
-  submission.onlineReviewContent = nextReviewContent;
+  assertProtectedSourceUnchanged(file.onlineReviewContent, nextReviewContent, "S", "教师不能修改学生的蓝色订正内容");
+  file.onlineReviewContent = nextReviewContent;
   submission.teacherNote = toSafeString(teacherNote) || null;
   submission.status = AssignmentStatus.REVIEWED.code;
 
-  if (isTextFileName(submission.fileName)) {
-    const editedName = deriveFileName(submission.fileName, "_edited");
-    const plain = exportPlainTextFromRich(submission.onlineReviewContent);
+  if (isTextFileName(file.fileName)) {
+    const editedName = deriveFileName(file.fileName, "_edited");
+    const plain = exportPlainTextFromRich(file.onlineReviewContent);
     const fileRecord = await putTextFile(db, { name: editedName, text: plain });
-    submission.reviewFileKey = fileRecord.key;
-    submission.reviewFileName = editedName;
+    file.reviewFileKey = fileRecord.key;
+    file.reviewFileName = editedName;
   }
 
   const saveTx = db.transaction([STORE_SUBMISSIONS], "readwrite");
@@ -1190,9 +1216,11 @@ export async function saveOnlineReview({ submissionId, reviewContent, teacherNot
   return submission;
 }
 
-export async function saveStudentCorrection({ submissionId, correctionContent, studentUser }) {
+export async function saveStudentCorrection({ submissionId, fileId, correctionContent, studentUser }) {
   const id = toSafeString(submissionId);
   if (!id) throw new Error("参数错误");
+  const targetFileId = toSafeString(fileId);
+  if (!targetFileId) throw new Error("请选择文件");
 
   const db = await openDb();
   const loadTx = db.transaction([STORE_SUBMISSIONS], "readonly");
@@ -1213,19 +1241,20 @@ export async function saveStudentCorrection({ submissionId, correctionContent, s
     db.close();
     throw new Error("只能订正本人提交的作业");
   }
+  const file = getSubmissionFileEntryOrThrow(submission, targetFileId);
 
   const nextCorrectionContent = String(correctionContent ?? "");
-  assertProtectedSourceUnchanged(submission.onlineReviewContent, nextCorrectionContent, "T", "学生不能修改教师的红色批注内容");
-  submission.onlineReviewContent = nextCorrectionContent;
-  submission.onlineStudentFixContent = "";
+  assertProtectedSourceUnchanged(file.onlineReviewContent, nextCorrectionContent, "T", "学生不能修改教师的红色批注内容");
+  file.onlineReviewContent = nextCorrectionContent;
+  file.onlineStudentFixContent = "";
   submission.status = AssignmentStatus.REVISED.code;
 
-  if (isTextFileName(submission.fileName)) {
-    const editedName = deriveFileName(submission.fileName, "_edited");
-    const plain = exportPlainTextFromRich(submission.onlineReviewContent);
+  if (isTextFileName(file.fileName)) {
+    const editedName = deriveFileName(file.fileName, "_edited");
+    const plain = exportPlainTextFromRich(file.onlineReviewContent);
     const fileRecord = await putTextFile(db, { name: editedName, text: plain });
-    submission.revisedFileKey = fileRecord.key;
-    submission.revisedFileName = editedName;
+    file.revisedFileKey = fileRecord.key;
+    file.revisedFileName = editedName;
   }
 
   const saveTx = db.transaction([STORE_SUBMISSIONS], "readwrite");
@@ -1235,9 +1264,11 @@ export async function saveStudentCorrection({ submissionId, correctionContent, s
   return submission;
 }
 
-export async function uploadReviewFile({ submissionId, reviewFile, teacherNote, teacherUser }) {
+export async function uploadReviewFile({ submissionId, fileId, reviewFile, teacherNote, teacherUser }) {
   const id = toSafeString(submissionId);
   if (!id) throw new Error("参数错误");
+  const targetFileId = toSafeString(fileId);
+  if (!targetFileId) throw new Error("请选择文件");
   if (!(reviewFile instanceof File)) throw new Error("请选择批改文件");
 
   const db = await openDb();
@@ -1250,11 +1281,12 @@ export async function uploadReviewFile({ submissionId, reviewFile, teacherNote, 
     throw new Error("作业不存在");
   }
   await assertTeacherCanAccessSubmission(db, submission, teacherUser);
+  const file = getSubmissionFileEntryOrThrow(submission, targetFileId);
 
   const fileRecord = await putFile(db, reviewFile);
 
-  submission.reviewFileKey = fileRecord.key;
-  submission.reviewFileName = reviewFile.name;
+  file.reviewFileKey = fileRecord.key;
+  file.reviewFileName = reviewFile.name;
   submission.teacherNote = toSafeString(teacherNote) || null;
   submission.status = AssignmentStatus.REVIEWED.code;
 
@@ -1266,8 +1298,83 @@ export async function uploadReviewFile({ submissionId, reviewFile, teacherNote, 
   return submission;
 }
 
-export async function loadSubmissionOriginalText(submission) {
-  const fileKey = submission?.originalFileKey;
+export async function saveSubmissionTeacherNote({ submissionId, teacherNote, teacherUser }) {
+  const id = toSafeString(submissionId);
+  if (!id) throw new Error("参数错误");
+
+  const db = await openDb();
+  const loadTx = db.transaction([STORE_SUBMISSIONS], "readonly");
+  const submission = await getRecord(loadTx.objectStore(STORE_SUBMISSIONS), id, "读取作业失败");
+  await txDone(loadTx);
+
+  if (!submission) {
+    db.close();
+    throw new Error("作业不存在");
+  }
+  await assertTeacherCanAccessSubmission(db, submission, teacherUser);
+
+  submission.teacherNote = toSafeString(teacherNote) || null;
+  if (submission.teacherNote && submission.status === AssignmentStatus.SUBMITTED.code) {
+    submission.status = AssignmentStatus.REVIEWED.code;
+  }
+
+  const tx = db.transaction([STORE_SUBMISSIONS], "readwrite");
+  tx.objectStore(STORE_SUBMISSIONS).put(submission);
+  await txDone(tx);
+  db.close();
+  return submission;
+}
+
+export async function deleteSubmissionFile({ submissionId, fileId, studentUser }) {
+  const id = toSafeString(submissionId);
+  if (!id) throw new Error("参数错误");
+  const targetFileId = toSafeString(fileId);
+  if (!targetFileId) throw new Error("请选择文件");
+  if (studentUser?.role !== "学生" || !studentUser?.username) {
+    throw new Error("仅学生可以删除提交文件");
+  }
+
+  const db = await openDb();
+  const tx = db.transaction([STORE_SUBMISSIONS], "readwrite");
+  const store = tx.objectStore(STORE_SUBMISSIONS);
+  const submission = await getRecord(store, id, "读取作业失败");
+
+  if (!submission) {
+    tx.abort();
+    db.close();
+    throw new Error("作业不存在");
+  }
+  if (submission.studentUsername !== studentUser.username) {
+    tx.abort();
+    db.close();
+    throw new Error("只能删除本人提交中的文件");
+  }
+
+  const remainingFiles = getSubmissionFiles(submission).filter((file) => file.id !== targetFileId);
+  if (remainingFiles.length === getSubmissionFiles(submission).length) {
+    tx.abort();
+    db.close();
+    throw new Error("文件不存在");
+  }
+
+  if (!remainingFiles.length) {
+    store.delete(submission.id);
+    await txDone(tx);
+    db.close();
+    return null;
+  }
+
+  submission.files = remainingFiles;
+  submission.submitTime = nowIso();
+  store.put(submission);
+  await txDone(tx);
+  db.close();
+  return submission;
+}
+
+export async function loadSubmissionOriginalText(submission, fileId) {
+  const file = getSubmissionFileEntryOrThrow(submission, fileId);
+  const fileKey = file.originalFileKey;
   const fileRecord = await getFileRecord(fileKey);
   if (!fileRecord?.blob) {
     throw new Error("原始作业文件不存在");

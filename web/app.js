@@ -674,7 +674,7 @@ function renderStudentPanel() {
       el("div", { style: "font-weight:700; margin-bottom:10px" }, "我可以看到的作业"),
       assignmentWrap
     ),
-    el("div", { style: "margin-top:12px" }, tableWrap)
+    null
   );
 }
 
@@ -736,12 +736,34 @@ async function openJoinClassModal({ afterJoin }) {
   });
 }
 
+async function openTeacherSubmissionModal(assignment) {
+  const body = el("div");
+
+  async function redraw() {
+    clear(body);
+    const submissions = await listSubmissionsForAssignment(assignment.id, currentUser.username);
+    body.append(
+      el(
+        "div",
+        { class: "panel-section" },
+        el("div", { style: "font-weight:700; margin-bottom:10px" }, `提交记录：${assignment.title}`),
+        buildSubmissionTable(submissions, { role: "教师" })
+      )
+    );
+  }
+
+  await redraw();
+  openModal({
+    title: `查看提交：${assignment.title}`,
+    body,
+    footerButtons: [el("button", { class: "btn", type: "button", onClick: closeModal }, "返回")],
+  });
+}
+
 function renderTeacherPanel() {
   const msg = el("div");
   const classWrap = el("div");
   const assignmentWrap = el("div");
-  const tableWrap = el("div");
-  let selectedAssignment = null;
 
   async function refreshSubmissions() {
     clear(tableWrap);
@@ -792,15 +814,14 @@ function renderTeacherPanel() {
         assignments,
         onChanged: refreshAll,
         onViewSubmissions: async (assignment) => {
-          selectedAssignment = assignment;
-          await refreshSubmissions();
+          await openTeacherSubmissionModal(assignment);
         },
       })
     );
   }
 
   async function refreshAll() {
-    await Promise.all([refreshClasses(), refreshAssignments(), refreshSubmissions()]);
+    await Promise.all([refreshClasses(), refreshAssignments()]);
   }
 
   refreshAll();
@@ -812,7 +833,7 @@ function renderTeacherPanel() {
     msg,
     el("div", { style: "margin-top:12px" }, classWrap),
     el("div", { style: "margin-top:12px" }, assignmentWrap),
-    el("div", { style: "margin-top:12px" }, tableWrap)
+    null
   );
 }
 

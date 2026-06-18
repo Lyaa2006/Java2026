@@ -1,10 +1,11 @@
 const DB_NAME = "hw_review_platform";
-const DB_VERSION = 2;
+const DB_VERSION = 4;
 
 const STORE_USERS = "users";
 const STORE_SUBMISSIONS = "submissions";
 const STORE_FILES = "files";
 const STORE_CLASSES = "classes";
+const STORE_ASSIGNMENTS = "assignments";
 
 export const AssignmentStatus = {
   SUBMITTED: { code: "SUBMITTED", label: "已提交" },
@@ -224,10 +225,14 @@ function openDb() {
         store.createIndex("byStudent", "studentUsername", { unique: false });
         store.createIndex("byTime", "submitTime", { unique: false });
         store.createIndex("byClass", "classId", { unique: false });
+        store.createIndex("byAssignment", "assignmentId", { unique: false });
       } else {
         const store = request.transaction.objectStore(STORE_SUBMISSIONS);
         if (!store.indexNames.contains("byClass")) {
           store.createIndex("byClass", "classId", { unique: false });
+        }
+        if (!store.indexNames.contains("byAssignment")) {
+          store.createIndex("byAssignment", "assignmentId", { unique: false });
         }
       }
 
@@ -238,6 +243,13 @@ function openDb() {
       if (!db.objectStoreNames.contains(STORE_CLASSES)) {
         const store = db.createObjectStore(STORE_CLASSES, { keyPath: "id" });
         store.createIndex("byOwner", "ownerUsername", { unique: false });
+      }
+
+      if (!db.objectStoreNames.contains(STORE_ASSIGNMENTS)) {
+        const store = db.createObjectStore(STORE_ASSIGNMENTS, { keyPath: "id" });
+        store.createIndex("byClass", "classId", { unique: false });
+        store.createIndex("byPublisher", "publisherUsername", { unique: false });
+        store.createIndex("byTime", "createdAt", { unique: false });
       }
     };
     request.onsuccess = () => resolve(request.result);
@@ -304,6 +316,64 @@ async function assertTeacherCanAccessSubmission(db, submission, teacherUser) {
   if (!hasTeacherClassAccess(klass, teacherUser.username)) {
     throw new Error("无该班级权限，不能查看或批改该作业");
   }
+}
+
+async function getClassOrThrow(db, classId, requiredMessage = "请选择班级") {
+  const id = toSafeString(classId);
+  if (!id) {
+    throw new Error(requiredMessage);
+  }
+
+  const tx = db.transaction([STORE_CLASSES], "readonly");
+  const klass = await getRecord(tx.objectStore(STORE_CLASSES), id, "读取班级失败");
+  await txDone(tx);
+  if (!klass) {
+    throw new Error("班级不存在");
+  }
+  return klass;
+}
+
+async function getAssignmentOrThrow(db, assignmentId) {
+  const id = toSafeString(assignmentId);
+  if (!id) {
+    throw new Error("请选择作业");
+  }
+
+  const tx = db.transaction([STORE_ASSIGNMENTS], "readonly");
+  const assignment = await getRecord(tx.objectStore(STORE_ASSIGNMENTS), id, "读取作业失败");
+  await txDone(tx);
+  if (!assignment) {
+    throw new Error("作业不存在");
+  }
+  return assignment;
+}
+
+function isStudentInClass(classRecord, studentUsername) {
+  const u = toSafeString(studentUsername);
+  if (!classRecord || !u) return false;
+  return (classRecord.memberUsernames || []).includes(u);
+}
+
+async function assertTeacherCanAccessClass(db, classId, teacherUser) {
+  if (teacherUser?.role !== "教师") {
+    throw new Error("仅教师可执行该操作");
+  }
+  const klass = await getClassOrThrow(db, classId);
+  if (!hasTeacherClassAccess(klass, teacherUser.username)) {
+    throw new Error("无该班级权限");
+  }
+  return klass;
+}
+
+async function assertStudentCanAccessAssignment(db, assignment, studentUser) {
+  if (studentUser?.role !== "学生") {
+    throw new Error("仅学生可执行该操作");
+  }
+  const klass = await getClassOrThrow(db, assignment?.classId);
+  if (!isStudentInClass(klass, studentUser.username)) {
+    throw new Error("你不在该班级中，无法查看该作业");
+  }
+  return klass;
 }
 
 export async function ensureDefaults() {
@@ -470,6 +540,120 @@ export async function listClassesForTeacher(teacherUsername) {
   const u = toSafeString(teacherUsername);
   const classes = await listClasses();
   return classes.filter((klass) => hasTeacherClassAccess(klass, u));
+}
+
+export async function createAssignment({ teacherUser, classId, title, description }) {
+  const db = await openDb();
+  const klass = await assertTeacherCanAccessClass(db, classId, teacherUser);
+
+  const assignmentTitle = toSafeString(title);
+  if (!assignmentTitle) {
+    db.close();
+    throw new Error("请填写作业标题");
+  }
+
+  const assignment = {
+    id: crypto.randomUUID(),
+    classId: klass.id,
+    className: klass.name,
+    title: assignmentTitle,
+    description: toSafeString(description),
+    publisherUsername: teacherUser.username,
+    publisherName: teacherUser.displayName,
+    createdAt: nowIso(),
+  };
+
+  const tx = db.transaction([STORE_ASSIGNMENTS], "readwrite");
+  tx.objectStore(STORE_ASSIGNMENTS).put(assignment);
+  await txDone(tx);
+  db.close();
+  return assignment;
+}
+
+export async function listAssignmentsForTeacher(teacherUsername) {
+  const u = toSafeString(teacherUsername);
+  if (!u) return [];
+
+  const db = await openDb();
+  const tx = db.transaction([STORE_ASSIGNMENTS, STORE_CLASSES], "readonly");
+  const assignments = await getAllRecords(tx.objectStore(STORE_ASSIGNMENTS), "读取作业列表失败");
+  const classes = await getAllRecords(tx.objectStore(STORE_CLASSES), "读取班级列表失败");
+  await txDone(tx);
+  db.close();
+
+  const accessibleClassIds = new Set(classes.filter((klass) => hasTeacherClassAccess(klass, u)).map((klass) => klass.id));
+  return assignments
+    .filter((assignment) => accessibleClassIds.has(assignment.classId))
+    .sort((a, b) => String(b.createdAt).localeCompare(String(a.createdAt)));
+}
+
+export async function listAssignmentsForStudent(studentUsername) {
+  const u = toSafeString(studentUsername);
+  if (!u) return [];
+
+  const db = await openDb();
+  const tx = db.transaction([STORE_ASSIGNMENTS, STORE_CLASSES], "readonly");
+  const assignments = await getAllRecords(tx.objectStore(STORE_ASSIGNMENTS), "读取作业列表失败");
+  const classes = await getAllRecords(tx.objectStore(STORE_CLASSES), "读取班级列表失败");
+  await txDone(tx);
+  db.close();
+
+  const joinedClassIds = new Set(classes.filter((klass) => isStudentInClass(klass, u)).map((klass) => klass.id));
+  return assignments
+    .filter((assignment) => joinedClassIds.has(assignment.classId))
+    .sort((a, b) => String(b.createdAt).localeCompare(String(a.createdAt)));
+}
+
+export async function getAssignment(assignmentId) {
+  const db = await openDb();
+  const assignment = await getAssignmentOrThrow(db, assignmentId);
+  db.close();
+  return assignment;
+}
+
+export async function submitAssignmentToAssignment({ studentUser, file, assignmentId }) {
+  if (!studentUser?.username) {
+    throw new Error("未登录");
+  }
+  if (studentUser.role !== "学生") {
+    throw new Error("仅学生可以提交作业");
+  }
+  if (!(file instanceof File)) {
+    throw new Error("请选择文件");
+  }
+
+  const db = await openDb();
+  const assignment = await getAssignmentOrThrow(db, assignmentId);
+  const klass = await assertStudentCanAccessAssignment(db, assignment, studentUser);
+  const fileRecord = await putFile(db, file);
+
+  const submission = {
+    id: crypto.randomUUID(),
+    assignmentId: assignment.id,
+    assignmentTitle: assignment.title,
+    studentUsername: studentUser.username,
+    studentName: studentUser.displayName,
+    classId: klass.id,
+    className: klass.name,
+    fileName: file.name,
+    submitTime: nowIso(),
+    status: AssignmentStatus.SUBMITTED.code,
+    teacherNote: null,
+    reviewFileName: null,
+    originalFileKey: fileRecord.key,
+    reviewFileKey: null,
+    revisedFileName: null,
+    revisedFileKey: null,
+    onlineReviewContent: null,
+    onlineStudentFixContent: null,
+    lineNotes: {},
+  };
+
+  const tx = db.transaction([STORE_SUBMISSIONS], "readwrite");
+  tx.objectStore(STORE_SUBMISSIONS).put(submission);
+  await txDone(tx);
+  db.close();
+  return submission;
 }
 
 export async function createClass({ teacherUser, name, description }) {
@@ -841,6 +1025,58 @@ export async function listSubmissionsForTeacher(teacherUsername) {
   const visible = submissions.filter((submission) => !submission.classId || accessibleClassIds.has(submission.classId));
   visible.sort((a, b) => String(b.submitTime).localeCompare(String(a.submitTime)));
   return visible;
+}
+
+export async function listSubmissionsForAssignmentLegacy(assignmentId) {
+  const id = toSafeString(assignmentId);
+  if (!id) return [];
+
+  const db = await openDb();
+  const tx = db.transaction([STORE_SUBMISSIONS], "readonly");
+  const index = tx.objectStore(STORE_SUBMISSIONS).index("byAssignment");
+  const submissions = await new Promise((resolve, reject) => {
+    const req = index.getAll(id);
+    req.onsuccess = () => resolve(req.result || []);
+    req.onerror = () => reject(req.error || new Error("读取作业提交列表失败"));
+  });
+  await txDone(tx);
+  db.close();
+  submissions.sort((a, b) => String(b.submitTime).localeCompare(String(a.submitTime)));
+  return submissions;
+}
+
+export async function listSubmissionsForAssignment(assignmentId, teacherUsername = "") {
+  const id = toSafeString(assignmentId);
+  if (!id) return [];
+  const u = toSafeString(teacherUsername);
+
+  const db = await openDb();
+  const tx = db.transaction([STORE_SUBMISSIONS, STORE_CLASSES], "readonly");
+  const submissionStore = tx.objectStore(STORE_SUBMISSIONS);
+  let submissions = [];
+
+  if (submissionStore.indexNames.contains("byAssignment")) {
+    const index = submissionStore.index("byAssignment");
+    submissions = await new Promise((resolve, reject) => {
+      const req = index.getAll(id);
+      req.onsuccess = () => resolve(req.result || []);
+      req.onerror = () => reject(req.error || new Error("读取作业提交列表失败"));
+    });
+  } else {
+    const allSubmissions = await getAllRecords(submissionStore, "读取作业提交列表失败");
+    submissions = allSubmissions.filter((submission) => submission.assignmentId === id);
+  }
+
+  if (u) {
+    const classes = await getAllRecords(tx.objectStore(STORE_CLASSES), "读取班级列表失败");
+    const accessibleClassIds = new Set(classes.filter((klass) => hasTeacherClassAccess(klass, u)).map((klass) => klass.id));
+    submissions = submissions.filter((submission) => !submission.classId || accessibleClassIds.has(submission.classId));
+  }
+
+  await txDone(tx);
+  db.close();
+  submissions.sort((a, b) => String(b.submitTime).localeCompare(String(a.submitTime)));
+  return submissions;
 }
 
 export async function listSubmissionsForStudent(studentUsername) {

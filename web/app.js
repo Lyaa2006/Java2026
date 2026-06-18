@@ -1,15 +1,20 @@
 import {
   createClass,
+  createAssignment,
   ensureDefaults,
   ensureOnlineEditableContent,
   exportPlainTextFromRich,
   getFileRecord,
+  getAssignment,
   getUser,
   grantClassTeacherAccess,
   isTextFileName,
+  listAssignmentsForStudent,
+  listAssignmentsForTeacher,
   listClassesForStudent,
   listClassesForTeacher,
   listSubmissionsForTeacher,
+  listSubmissionsForAssignment,
   listSubmissionsForStudent,
   listTeachers,
   loadSubmissionOriginalText,
@@ -21,7 +26,7 @@ import {
   saveOnlineReview,
   saveStudentCorrection,
   statusLabel,
-  submitAssignment,
+  submitAssignmentToAssignment,
   uploadReviewFile,
 } from "./storage.js";
 
@@ -456,59 +461,200 @@ function renderDashboard() {
   }
 }
 
-function renderStudentPanel() {
-  const msg = el("div");
-  const fileInput = el("input", { type: "file", accept: ".pdf,.doc,.docx,.zip,.java,.txt,.md,.csv" });
-  const classSelect = el("select");
-  const classHint = el("div", { class: "hint" });
-  const submitBtn = el(
-    "button",
-    {
-      class: "btn primary",
-      type: "button",
-      onClick: async () => {
-        clear(msg);
-        try {
-          const file = fileInput.files?.[0];
-          await submitAssignment({ studentUser: currentUser, file, classId: classSelect.value });
-          fileInput.value = "";
-          msg.append(showNotice({ type: "ok", text: "上传成功" }));
-          await refresh();
-        } catch (err) {
-          msg.append(showNotice({ type: "bad", text: err?.message || "上传失败" }));
-        }
-      },
-    },
-    "上传作业"
+function buildAssignmentCard(assignment, actions = []) {
+  return el(
+    "div",
+    { class: "class-item" },
+    el(
+      "div",
+      null,
+      el("div", { style: "font-weight:700" }, assignment.title || "未命名作业"),
+      el(
+        "div",
+        { class: "muted" },
+        `班级：${assignment.className || "未分班"}｜发布教师：${assignment.publisherName || assignment.publisherUsername || "未知"}｜发布时间：${formatTime(assignment.createdAt)}`
+      ),
+      assignment.description ? el("div", { class: "hint", text: assignment.description }) : null
+    ),
+    el("div", { class: "class-actions" }, actions)
   );
+}
 
-  const tableWrap = el("div");
+async function openStudentSubmitModal(assignment, afterSubmit) {
+  const fileInput = el("input", { type: "file", accept: ".pdf,.doc,.docx,.zip,.java,.txt,.md,.csv" });
+  const msg = el("div");
 
-  async function refreshClasses() {
-    const classes = await listClassesForStudent(currentUser.username);
-    const joined = classes.filter((klass) => klass.joined);
-    clear(classSelect);
-    if (!joined.length) {
-      classSelect.append(el("option", { value: "", text: "请先加入班级" }));
-      classSelect.disabled = true;
-      classHint.textContent = "学生提交作业前必须先加入一个班级。";
-    } else {
-      classSelect.disabled = false;
-      for (const klass of joined) {
-        classSelect.append(el("option", { value: klass.id, text: klass.name }));
-      }
-      classHint.textContent = `已加入 ${joined.length} 个班级，提交结果仅该班有权限教师可见。`;
+  openModal({
+    title: `提交作业：${assignment.title}`,
+    body: el(
+      "div",
+      null,
+      el("div", { class: "form-row" }, el("label", { text: "所属班级" }), el("div", { class: "pill" }, assignment.className || "未分班")),
+      assignment.description ? el("div", { class: "form-row" }, el("label", { text: "作业说明" }), el("div", { class: "notice" }, assignment.description)) : null,
+      el("div", { class: "form-row" }, el("label", { text: "选择提交文件" }), fileInput),
+      msg
+    ),
+    footerButtons: [
+      el("button", { class: "btn", type: "button", onClick: closeModal }, "取消"),
+      el(
+        "button",
+        {
+          class: "btn primary",
+          type: "button",
+          onClick: async () => {
+            clear(msg);
+            try {
+              await submitAssignmentToAssignment({
+                studentUser: currentUser,
+                file: fileInput.files?.[0],
+                assignmentId: assignment.id,
+              });
+              if (afterSubmit) await afterSubmit();
+              closeModal();
+            } catch (err) {
+              msg.append(showNotice({ type: "bad", text: err?.message || "提交失败" }));
+            }
+          },
+        },
+        "提交"
+      ),
+    ],
+  });
+}
+
+function buildTeacherAssignmentManager({ classes, assignments, onChanged, onViewSubmissions }) {
+  const classSelect = el("select", null, el("option", { value: "", text: "选择发布班级" }));
+  const titleInput = el("input", { placeholder: "作业标题" });
+  const descInput = el("textarea", { placeholder: "作业说明（可选）" });
+  const msg = el("div");
+  const list = el("div", { class: "class-list" });
+
+  descInput.style.minHeight = "72px";
+
+  for (const klass of classes) {
+    classSelect.append(el("option", { value: klass.id, text: klass.name }));
+  }
+
+  function redrawList() {
+    clear(list);
+    if (!assignments.length) {
+      list.append(showNotice({ type: "warn", text: "暂无已发布作业。" }));
+      return;
+    }
+
+    for (const assignment of assignments) {
+      list.append(
+        buildAssignmentCard(assignment, [
+          el(
+            "button",
+            {
+              class: "btn small",
+              type: "button",
+              onClick: () => onViewSubmissions?.(assignment),
+            },
+            "查看提交"
+          ),
+        ])
+      );
     }
   }
 
-  async function refresh() {
+  redrawList();
+
+  return el(
+    "div",
+    { class: "panel-section" },
+    el("div", { style: "font-weight:700; margin-bottom:10px" }, "发布班级作业"),
+    el(
+      "div",
+      { class: "row" },
+      el("div", { style: "min-width:220px; flex:1" }, el("label", { text: "班级" }), classSelect),
+      el("div", { style: "min-width:260px; flex:1" }, el("label", { text: "标题" }), titleInput)
+    ),
+    el("div", { class: "form-row" }, el("label", { text: "说明" }), descInput),
+    el(
+      "div",
+      { class: "row" },
+      el(
+        "button",
+        {
+          class: "btn primary",
+          type: "button",
+          onClick: async () => {
+            clear(msg);
+            try {
+              await createAssignment({
+                teacherUser: currentUser,
+                classId: classSelect.value,
+                title: titleInput.value,
+                description: descInput.value,
+              });
+              titleInput.value = "";
+              descInput.value = "";
+              msg.append(showNotice({ type: "ok", text: "作业发布成功" }));
+              if (onChanged) await onChanged();
+            } catch (err) {
+              msg.append(showNotice({ type: "bad", text: err?.message || "发布失败" }));
+            }
+          },
+        },
+        "发布作业"
+      )
+    ),
+    msg,
+    el("div", { style: "font-weight:700; margin-top:12px" }, "已发布作业"),
+    list
+  );
+}
+
+function renderStudentPanel() {
+  const msg = el("div");
+  const assignmentWrap = el("div", { class: "class-list" });
+  const tableWrap = el("div");
+  const classHint = el("div", { class: "hint" });
+
+  async function refreshAssignments() {
+    const classes = await listClassesForStudent(currentUser.username);
+    const joined = classes.filter((klass) => klass.joined);
+    classHint.textContent = joined.length
+      ? `已加入 ${joined.length} 个班级，只能看到这些班级里发布的作业。`
+      : "你还没有加入班级，请先申请加入班级。";
+
+    clear(assignmentWrap);
+    const assignments = await listAssignmentsForStudent(currentUser.username);
+    if (!assignments.length) {
+      assignmentWrap.append(showNotice({ type: "warn", text: "暂无你所在班级发布的作业。" }));
+      return;
+    }
+
+    for (const assignment of assignments) {
+      assignmentWrap.append(
+        buildAssignmentCard(assignment, [
+          el(
+            "button",
+            {
+              class: "btn small primary",
+              type: "button",
+              onClick: () => openStudentSubmitModal(assignment, refreshAll),
+            },
+            "提交作业"
+          ),
+        ])
+      );
+    }
+  }
+
+  async function refreshSubmissions() {
     clear(tableWrap);
     const submissions = await listSubmissionsForStudent(currentUser.username);
     tableWrap.append(buildSubmissionTable(submissions, { role: "学生" }));
   }
 
-  refreshClasses();
-  refresh();
+  async function refreshAll() {
+    await Promise.all([refreshAssignments(), refreshSubmissions()]);
+  }
+
+  refreshAll();
 
   return el(
     "div",
@@ -517,17 +663,17 @@ function renderStudentPanel() {
     el(
       "div",
       { class: "row" },
-      el("div", { style: "min-width:220px; flex:1" }, el("label", { text: "提交班级" }), classSelect, classHint),
-      el("button", { class: "btn", type: "button", onClick: () => openJoinClassModal({ afterJoin: refreshClasses }) }, "加入班级")
-    ),
-    el(
-      "div",
-      { class: "row", style: "margin-top:12px" },
-      el("div", { style: "min-width:320px; flex:1" }, fileInput),
-      submitBtn,
-      el("button", { class: "btn", type: "button", onClick: refresh }, "刷新")
+      el("div", { style: "min-width:260px; flex:1" }, classHint),
+      el("button", { class: "btn", type: "button", onClick: () => openJoinClassModal({ afterJoin: refreshAll }) }, "加入班级"),
+      el("button", { class: "btn", type: "button", onClick: refreshAll }, "刷新")
     ),
     msg,
+    el(
+      "div",
+      { class: "panel-section", style: "margin-top:12px" },
+      el("div", { style: "font-weight:700; margin-bottom:10px" }, "我可以看到的作业"),
+      assignmentWrap
+    ),
     el("div", { style: "margin-top:12px" }, tableWrap)
   );
 }
@@ -593,12 +739,42 @@ async function openJoinClassModal({ afterJoin }) {
 function renderTeacherPanel() {
   const msg = el("div");
   const classWrap = el("div");
+  const assignmentWrap = el("div");
   const tableWrap = el("div");
+  let selectedAssignment = null;
 
   async function refreshSubmissions() {
     clear(tableWrap);
-    const submissions = await listSubmissionsForTeacher(currentUser.username);
-    tableWrap.append(buildSubmissionTable(submissions, { role: "教师" }));
+    const submissions = selectedAssignment
+      ? await listSubmissionsForAssignment(selectedAssignment.id, currentUser.username)
+      : await listSubmissionsForTeacher(currentUser.username);
+    const title = selectedAssignment ? `提交记录：${selectedAssignment.title}` : "全部提交记录";
+    tableWrap.append(
+      el(
+        "div",
+        { class: "panel-section" },
+        el(
+          "div",
+          { class: "row-between", style: "margin-bottom:10px" },
+          el("div", { style: "font-weight:700" }, title),
+          selectedAssignment
+            ? el(
+                "button",
+                {
+                  class: "btn small",
+                  type: "button",
+                  onClick: async () => {
+                    selectedAssignment = null;
+                    await refreshSubmissions();
+                  },
+                },
+                "查看全部"
+              )
+            : null
+        ),
+        buildSubmissionTable(submissions, { role: "教师" })
+      )
+    );
   }
 
   async function refreshClasses() {
@@ -607,8 +783,24 @@ function renderTeacherPanel() {
     classWrap.append(buildTeacherClassManager({ classes, teachers, onChanged: refreshAll }));
   }
 
+  async function refreshAssignments() {
+    clear(assignmentWrap);
+    const [classes, assignments] = await Promise.all([listClassesForTeacher(currentUser.username), listAssignmentsForTeacher(currentUser.username)]);
+    assignmentWrap.append(
+      buildTeacherAssignmentManager({
+        classes,
+        assignments,
+        onChanged: refreshAll,
+        onViewSubmissions: async (assignment) => {
+          selectedAssignment = assignment;
+          await refreshSubmissions();
+        },
+      })
+    );
+  }
+
   async function refreshAll() {
-    await Promise.all([refreshClasses(), refreshSubmissions()]);
+    await Promise.all([refreshClasses(), refreshAssignments(), refreshSubmissions()]);
   }
 
   refreshAll();
@@ -619,6 +811,7 @@ function renderTeacherPanel() {
     el("div", { class: "row-between" }, el("div", { style: "font-weight:700" }, "教师端"), el("button", { class: "btn", type: "button", onClick: refreshAll }, "刷新")),
     msg,
     el("div", { style: "margin-top:12px" }, classWrap),
+    el("div", { style: "margin-top:12px" }, assignmentWrap),
     el("div", { style: "margin-top:12px" }, tableWrap)
   );
 }

@@ -378,38 +378,6 @@ async function assertStudentCanAccessAssignment(db, assignment, studentUser) {
 
 export async function ensureDefaults() {
   const db = await openDb();
-  const tx = db.transaction([STORE_USERS, STORE_CLASSES], "readwrite");
-  const users = tx.objectStore(STORE_USERS);
-  const classes = tx.objectStore(STORE_CLASSES);
-
-  const existing = await getRecord(users, "teacher");
-
-  if (!existing) {
-    users.put({
-      username: "teacher",
-      password: "123456",
-      displayName: "默认教师",
-      role: "教师",
-      createdAt: nowIso(),
-    });
-  }
-
-  const defaultClass = await getRecord(classes, "default-class");
-  if (!defaultClass) {
-    classes.put({
-      id: "default-class",
-      name: "默认班级",
-      description: "系统内置演示班级",
-      ownerUsername: "teacher",
-      ownerName: "默认教师",
-      controllerUsernames: [],
-      memberUsernames: [],
-      pendingUsernames: [],
-      createdAt: nowIso(),
-    });
-  }
-
-  await txDone(tx);
   db.close();
 }
 

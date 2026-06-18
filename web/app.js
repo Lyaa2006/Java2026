@@ -343,8 +343,8 @@ function renderLogin() {
   }
 
   function buildLoginForm() {
-    const username = el("input", { autocomplete: "username", placeholder: "例如：teacher" });
-    const password = el("input", { autocomplete: "current-password", type: "password", placeholder: "例如：123456" });
+    const username = el("input", { autocomplete: "username", placeholder: "请输入用户名" });
+    const password = el("input", { autocomplete: "current-password", type: "password", placeholder: "请输入密码" });
     const role = el(
       "select",
       null,
